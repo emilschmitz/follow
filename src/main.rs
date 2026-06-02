@@ -144,6 +144,35 @@ fn render_list(
     Ok(())
 }
 
+fn strip_shopt_wrapper(cmd: &str) -> String {
+    // We are looking to strip the prefix:
+    // shopt -u promptvars nullglob extglob nocaseglob dotglob; ( 
+    // And potentially trailing background boilerplate like:
+    // )
+    // __code=$?; pgrep -g 0 ...
+    
+    let mut cleaned = cmd.trim();
+    
+    let prefix = "shopt -u promptvars nullglob extglob nocaseglob dotglob; (";
+    if cleaned.starts_with(prefix) {
+        cleaned = &cleaned[prefix.len()..];
+        cleaned = cleaned.trim_start();
+        
+        // Now try to strip the closing parenthesis and everything after it.
+        // We look for a line or section starting with `) \n __code=$?` or just `)` at the end
+        if let Some(idx) = cleaned.rfind(')') {
+            // Check if what follows the ')' is mostly just the pgrep exit code tracking noise
+            let after_paren = cleaned[idx + 1..].trim();
+            if after_paren.is_empty() || after_paren.starts_with("__code=$?") || after_paren.starts_with("; __code=$?") || after_paren.starts_with("\n__code=$?") {
+                cleaned = &cleaned[..idx];
+                cleaned = cleaned.trim_end();
+            }
+        }
+    }
+    
+    cleaned.to_string()
+}
+
 fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
     let _ = std::fs::write(&json_path, ""); // Ensure file exists to reset missing_count
     
@@ -239,7 +268,7 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
                     should_redraw = true;
 
                     let cache_clone = Arc::clone(&cache);
-                    let cmd_to_fetch = cmd_text.clone();
+                    let cmd_to_fetch = strip_shopt_wrapper(&cmd_text);
                     std::thread::spawn(move || {
                         let result = match explainshell::fetch_html(&cmd_to_fetch) {
                             Ok(html) => explainshell::parse_html(&cmd_to_fetch, &html),
