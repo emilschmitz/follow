@@ -59,7 +59,7 @@ fn highlight_cmd_source(cmd: &str, source: &str) -> String {
 // ── Watch mode (right-pane TUI) ───────────────────────────────────────────────
 
 fn render_watch(
-    cmds: &[String],
+    cmds: &[snoop::Command],
     selected: usize,
     scroll: usize,
     explanation: &explainshell::Explanation,
@@ -94,10 +94,11 @@ fn render_watch(
     for i in 0..list_height {
         let idx = scroll + i;
         if idx < cmds.len() {
+            let cmd_text = &cmds[idx].text;
             let display_cmd = if idx == selected {
-                explanation.formatted_command.as_deref().unwrap_or(&cmds[idx])
+                explanation.formatted_command.as_deref().unwrap_or(cmd_text)
             } else {
-                &cmds[idx]
+                cmd_text
             };
 
             if idx == selected {
@@ -152,7 +153,9 @@ fn render_watch(
     out.push_str("\x1b[0m\r\n");
 
     // 4. Explanation (JSON)
-    let json_str = explainshell::explanation_to_json(explanation, active_match_idx);
+    let active_status = cmds.get(selected).and_then(|c| c.status);
+    let json_str = explainshell::explanation_to_json(explanation, active_match_idx, active_status);
+
     let exp_lines: Vec<&str> = json_str.lines().collect();
     for i in 0..explanation_height {
         if i < exp_lines.len() {
@@ -209,7 +212,7 @@ fn render_watch(
 }
 
 fn watch_mode(trace_path: String) -> Result<()> {
-    let commands: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let commands: Arc<Mutex<Vec<snoop::Command>>> = Arc::new(Mutex::new(Vec::new()));
     snoop::start_from_file(trace_path, Arc::clone(&commands));
 
     enable_raw_mode()?;
@@ -256,11 +259,22 @@ fn watch_mode(trace_path: String) -> Result<()> {
         let selected_cmd = {
             let cmds = commands.lock().unwrap();
             if selected < cmds.len() {
-                Some(cmds[selected].clone())
+                Some(cmds[selected].text.clone())
             } else {
                 None
             }
         };
+
+        let selected_status = {
+            let cmds = commands.lock().unwrap();
+            if selected < cmds.len() {
+                cmds[selected].status
+            } else {
+                None
+            }
+        };
+
+        let current_status_str = selected_status.map_or("running".to_string(), |s| s.to_string());
 
         if let Some(cmd_text) = selected_cmd {
             let cached_opt = {
@@ -271,9 +285,9 @@ fn watch_mode(trace_path: String) -> Result<()> {
             match cached_opt {
                 Some(cached) => {
                     if let Some(err) = &cached.error {
-                        current_cache_status = format!("error: {}", err);
+                        current_cache_status = format!("error: {} ({})", err, current_status_str);
                     } else {
-                        current_cache_status = format!("loaded: {}", cached.matches.len());
+                        current_cache_status = format!("loaded: {} ({})", cached.matches.len(), current_status_str);
                     }
                     current_explanation = cached;
                 }
@@ -289,7 +303,7 @@ fn watch_mode(trace_path: String) -> Result<()> {
                         cache_lock.insert(cmd_text.clone(), loading_exp.clone());
                     }
                     current_explanation = loading_exp;
-                    current_cache_status = "loading".to_string();
+                    current_cache_status = format!("loading ({})", current_status_str);
                     should_redraw = true;
 
                     let cache_clone = Arc::clone(&cache);
@@ -416,12 +430,12 @@ fn real_shell(name: &str) -> PathBuf {
     PathBuf::from(format!("/bin/{}", name))
 }
 
-/// Write a tiny wrapper script that logs the -c argument then exec's the real shell.
+/// Write a tiny wrapper script that logs the -c argument then runs the real shell, capturing status.
 fn write_wrapper(path: PathBuf, real: &PathBuf, trace: &PathBuf) -> Result<()> {
-    // Using printf instead of echo to avoid issues with special chars.
-    // The wrapper is deliberately tiny — no bashisms, pure POSIX sh.
     let script = format!(
-        "#!/bin/sh\nif [ \"$1\" = \"-c\" ] && [ -n \"$2\" ]; then printf '%s\\n' \"$2\" >> {} 2>/dev/null; fi\nexec {} \"$@\"\n",
+        "#!/bin/sh\nif [ \"$1\" = \"-c\" ] && [ -n \"$2\" ]; then\n  PID=$$\n  CMD=$(printf '%s' \"$2\" | tr '\\n' ' ')\n  printf 'START\\t%d\\t%s\\n' \"$PID\" \"$CMD\" >> {} 2>/dev/null\n  {} \"$@\"\n  STATUS=$?\n  printf 'END\\t%d\\t%d\\n' \"$PID\" \"$STATUS\" >> {} 2>/dev/null\n  exit $STATUS\nelse\n  exec {} \"$@\"\nfi\n",
+        sq(&trace.to_string_lossy()),
+        sq(&real.to_string_lossy()),
         sq(&trace.to_string_lossy()),
         sq(&real.to_string_lossy()),
     );

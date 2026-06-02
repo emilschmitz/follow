@@ -317,21 +317,28 @@ pub fn parse_html(cmd: &str, html: &str) -> Explanation {
 }
 
 /// Convert an Explanation to a clean JSON string, highlighting the specified match index in bold red.
-pub fn explanation_to_json(exp: &Explanation, highlight_idx: Option<usize>) -> String {
+pub fn explanation_to_json(exp: &Explanation, active_match_idx: Option<usize>, status: Option<i32>) -> String {
+    let mut status_json = String::new();
+    if let Some(code) = status {
+        status_json = format!(r#",
+  "status": {}"#, code);
+    }
+
     if let Some(err) = &exp.error {
         return format!(
             r#"{{
-  "command": "{}",
+  "command": "{}"{},
   "error": "{}"
 }}"#,
             escape_json(&exp.command),
+            status_json,
             escape_json(err)
         );
     }
 
     let mut matches_json = Vec::new();
     for m in &exp.matches {
-        let is_highlighted = Some(m.index) == highlight_idx;
+        let is_highlighted = Some(m.index) == active_match_idx;
         let escaped_source = escape_json(&m.source);
         let escaped_help = escape_json(&m.explanation);
         
@@ -354,12 +361,13 @@ pub fn explanation_to_json(exp: &Explanation, highlight_idx: Option<usize>) -> S
 
     format!(
         r#"{{
-  "command": "{}",
+  "command": "{}"{},
   "matches": [
 {}
   ]
 }}"#,
         escape_json(&exp.command),
+        status_json,
         matches_json.join(",\n")
     )
 }
