@@ -58,7 +58,7 @@ fn highlight_cmd_source(cmd: &str, source: &str) -> String {
 
 // ── Watch mode (right-pane TUI) ───────────────────────────────────────────────
 
-fn render_watch(
+fn render_list(
     cmds: &[snoop::Command],
     selected: usize,
     scroll: usize,
@@ -72,12 +72,7 @@ fn render_watch(
     out.push_str("\x1b[H\x1b[2J\x1b[?25l");
 
     let header_height = 1;
-    let separator_height = 1;
-    
-    // Calculate list height (40% of rows, min 5, max rows - 6)
-    let total_rows = rows as usize;
-    let list_height = (total_rows * 40 / 100).max(5).min(total_rows.saturating_sub(6));
-    let explanation_height = total_rows.saturating_sub(list_height + header_height + separator_height);
+    let list_height = (rows as usize).saturating_sub(header_height);
 
     // 1. Header
     let header = format!(" ◉ flw  {} cmds  (↑↓ scroll · ←→ inspect · q quit) ", cmds.len());
@@ -138,70 +133,7 @@ fn render_watch(
         } else {
             out.push_str(&" ".repeat(cols as usize));
         }
-        out.push_str("\r\n");
-    }
-
-    // 3. Separator
-    let sep_title = " 🧭 ExplainShell JSON ";
-    let sep_line: String = sep_title
-        .chars()
-        .chain(std::iter::repeat('─'))
-        .take(cols as usize)
-        .collect();
-    out.push_str("\x1b[36m"); // Cyan color for separator
-    out.push_str(&sep_line);
-    out.push_str("\x1b[0m\r\n");
-
-    // 4. Explanation (JSON)
-    let active_status = cmds.get(selected).and_then(|c| c.status);
-    let active_pid = cmds.get(selected).map(|c| c.id);
-    let json_str = explainshell::explanation_to_json(explanation, active_match_idx, active_status, active_pid);
-
-    let exp_lines: Vec<&str> = json_str.lines().collect();
-    for i in 0..explanation_height {
-        if i < exp_lines.len() {
-            let line = exp_lines[i];
-            
-            // Calculate visual length (excluding ANSI escape sequences)
-            let mut visual_len = 0;
-            let mut in_escape = false;
-            let mut char_count_including_escapes = 0;
-            
-            for c in line.chars() {
-                if c == '\x1b' {
-                    in_escape = true;
-                }
-                
-                if in_escape {
-                    char_count_including_escapes += 1;
-                    if c == 'm' || c == 'K' || c == 'H' || c == 'J' {
-                        in_escape = false;
-                    }
-                } else {
-                    visual_len += 1;
-                    char_count_including_escapes += 1;
-                    if visual_len >= cols as usize {
-                        break;
-                    }
-                }
-            }
-            
-            let truncated: String = line.chars().take(char_count_including_escapes).collect();
-            out.push_str(&truncated);
-            
-            // Safe reset if line ended within red block
-            if line.contains("\x1b[31;1m") && !truncated.contains("\x1b[0m") {
-                out.push_str("\x1b[0m");
-            }
-            
-            let extra = (cols as usize).saturating_sub(visual_len);
-            if extra > 0 {
-                out.push_str(&" ".repeat(extra));
-            }
-        } else {
-            out.push_str(&" ".repeat(cols as usize));
-        }
-        if i < explanation_height - 1 {
+        if i < list_height - 1 {
             out.push_str("\r\n");
         }
     }
@@ -212,7 +144,7 @@ fn render_watch(
     Ok(())
 }
 
-fn watch_mode(trace_path: String) -> Result<()> {
+fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
     let commands: Arc<Mutex<Vec<snoop::Command>>> = Arc::new(Mutex::new(Vec::new()));
     snoop::start_from_file(trace_path, Arc::clone(&commands));
 
@@ -234,10 +166,7 @@ fn watch_mode(trace_path: String) -> Result<()> {
 
     loop {
         let (cols, rows) = size()?;
-        let visible_list_rows = {
-            let total_rows = rows as usize;
-            (total_rows * 40 / 100).max(5).min(total_rows.saturating_sub(6))
-        };
+        let visible_list_rows = (rows as usize).saturating_sub(1);
 
         let mut should_redraw = false;
         let current_explanation: explainshell::Explanation;
@@ -340,7 +269,14 @@ fn watch_mode(trace_path: String) -> Result<()> {
             || should_redraw 
         {
             let cmds = commands.lock().unwrap();
-            render_watch(&cmds, selected, scroll, &current_explanation, active_match_idx, cols, rows, &mut stdout)?;
+            
+            // Generate JSON and write to file for the bottom pane
+            let active_status = cmds.get(selected).and_then(|c| c.status);
+            let active_pid = cmds.get(selected).map(|c| c.id);
+            let json_str = explainshell::explanation_to_json(&current_explanation, active_match_idx, active_status, active_pid);
+            let _ = std::fs::write(&json_path, json_str);
+
+            render_list(&cmds, selected, scroll, &current_explanation, active_match_idx, cols, rows, &mut stdout)?;
             last_selected = selected;
             last_active_match_idx = active_match_idx;
             last_cache_status = Some(current_cache_status);
@@ -398,7 +334,7 @@ fn watch_mode(trace_path: String) -> Result<()> {
                 },
                 Event::Resize(c, r) => {
                     let cmds = commands.lock().unwrap();
-                    render_watch(&cmds, selected, scroll, &current_explanation, active_match_idx, c, r, &mut stdout)?;
+                    render_list(&cmds, selected, scroll, &current_explanation, active_match_idx, c, r, &mut stdout)?;
                     last_count = cmds.len();
                 }
                 _ => {}
@@ -409,6 +345,25 @@ fn watch_mode(trace_path: String) -> Result<()> {
     write!(stdout, "\x1b[2J\x1b[H")?;
     stdout.flush()?;
     Ok(())
+}
+
+fn watch_json_mode(json_path: String) -> Result<()> {
+    let mut last_content = String::new();
+    
+    // Clear screen on start
+    print!("\x1b[H\x1b[2J");
+    io::stdout().flush()?;
+    
+    loop {
+        if let Ok(content) = std::fs::read_to_string(&json_path) {
+            if content != last_content {
+                print!("\x1b[H\x1b[2J{}", content);
+                io::stdout().flush()?;
+                last_content = content;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 
@@ -452,6 +407,7 @@ fn launch_mode(agent_name: String, extra_args: Vec<String>) -> Result<()> {
     let pid = std::process::id();
     let wrapper_dir = PathBuf::from(format!("/tmp/flw_{}_bin", pid));
     let trace_path = PathBuf::from(format!("/tmp/flw_{}.trace", pid));
+    let json_path = PathBuf::from(format!("/tmp/flw_{}.json", pid));
     let flw_bin = std::env::current_exe()?;
     let in_tmux = std::env::var("TMUX").is_ok();
     let window_name = format!("flw-{}", agent_name);
@@ -461,35 +417,50 @@ fn launch_mode(agent_name: String, extra_args: Vec<String>) -> Result<()> {
     write_wrapper(wrapper_dir.join("bash"), &real_shell("bash"), &trace_path)?;
     write_wrapper(wrapper_dir.join("sh"), &real_shell("sh"), &trace_path)?;
 
+    // Create an empty json file initially so the tail loop doesn't fail
+    std::fs::write(&json_path, "")?;
+
     // Left pane: agent runs normally, just with our wrapper dir prepended to PATH
     let extra: String = extra_args.iter().map(|a| format!(" {}", sq(a))).collect();
 
-
-    // Right pane: flw --watch <trace>
-    let right_cmd = format!(
-        "{} --watch {}",
+    // Right pane top: flw --watch-list <trace> <json>
+    let right_top_cmd = format!(
+        "{} --watch-list {} {}",
         sq(&flw_bin.to_string_lossy()),
         sq(&trace_path.to_string_lossy()),
+        sq(&json_path.to_string_lossy()),
+    );
+
+    // Right pane bottom: flw --watch-json <json>
+    let right_bottom_cmd = format!(
+        "{} --watch-json {}",
+        sq(&flw_bin.to_string_lossy()),
+        sq(&json_path.to_string_lossy()),
+    );
+
+    // split-window -h creates right pane. split-window -v creates bottom right pane.
+    let open_pane = format!(
+        "split-window -h {} \\; split-window -v {}",
+        sq(&right_top_cmd),
+        sq(&right_bottom_cmd)
     );
 
     // Ctrl+F toggle using tmux's native if-shell command.
-    // if-shell runs a shell condition, then dispatches one of two tmux commands.
-    // Unlike run-shell, it produces no output in the pane.
-    let open_pane = format!("split-window -h {}", sq(&right_cmd));
     std::process::Command::new("tmux")
         .args([
             "bind-key", "-n", "C-f",
             "if-shell", "[ $(tmux list-panes | wc -l) -eq 1 ]",
             &open_pane,
-            "kill-pane -t :.1",
+            "kill-pane -a -t 0",
         ])
         .status()?;
 
     // Also clean up the C-f binding when agi exits
     let cleanup = format!(
-        "; tmux unbind-key -n C-f 2>/dev/null; rm -rf {} {}",
+        "; tmux unbind-key -n C-f 2>/dev/null; rm -rf {} {} {}",
         sq(&wrapper_dir.to_string_lossy()),
         sq(&trace_path.to_string_lossy()),
+        sq(&json_path.to_string_lossy()),
     );
     let left_cmd = format!(
         "PATH={}:$PATH {}{}{}",
@@ -527,9 +498,15 @@ fn launch_mode(agent_name: String, extra_args: Vec<String>) -> Result<()> {
 fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
 
-    if argv.first().map(String::as_str) == Some("--watch") {
-        let trace = argv.get(1).cloned().expect("flw --watch <trace_file>");
-        return watch_mode(trace);
+    if argv.first().map(String::as_str) == Some("--watch-list") {
+        let trace = argv.get(1).cloned().expect("flw --watch-list <trace_file> <json_file>");
+        let json = argv.get(2).cloned().expect("flw --watch-list <trace_file> <json_file>");
+        return watch_list_mode(trace, json);
+    }
+    
+    if argv.first().map(String::as_str) == Some("--watch-json") {
+        let json = argv.get(1).cloned().expect("flw --watch-json <json_file>");
+        return watch_json_mode(json);
     }
 
     let agent_name = argv
