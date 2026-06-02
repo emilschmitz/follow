@@ -26,13 +26,44 @@ impl Drop for TerminalRestorer {
     }
 }
 
+
+fn highlight_cmd_source_by_index(cmd: &str, start: usize, end: usize) -> String {
+    let chars: Vec<char> = cmd.chars().collect();
+    if start < end && end <= chars.len() {
+        let before: String = chars[..start].iter().collect();
+        let matched: String = chars[start..end].iter().collect();
+        let after: String = chars[end..].iter().collect();
+        format!("{}\x1b[31;1;7m{}\x1b[27;0;7m{}", before, matched, after)
+    } else {
+        cmd.to_string()
+    }
+}
+
+fn highlight_cmd_source(cmd: &str, source: &str) -> String {
+    let clean_source = if let Some(idx) = source.find('(') {
+        &source[..idx]
+    } else {
+        source
+    };
+
+    if let Some(pos) = cmd.find(clean_source) {
+        let before = &cmd[..pos];
+        let matched = &cmd[pos..pos + clean_source.len()];
+        let after = &cmd[pos + clean_source.len()..];
+        format!("{}\x1b[31;1;7m{}\x1b[27;0;7m{}", before, matched, after)
+    } else {
+        cmd.to_string()
+    }
+}
+
 // ── Watch mode (right-pane TUI) ───────────────────────────────────────────────
 
 fn render_watch(
     cmds: &[String],
     selected: usize,
     scroll: usize,
-    explanation: &str,
+    explanation: &explainshell::Explanation,
+    active_match_idx: Option<usize>,
     cols: u16,
     rows: u16,
     stdout: &mut io::Stdout,
@@ -49,7 +80,7 @@ fn render_watch(
     let explanation_height = total_rows.saturating_sub(list_height + header_height + separator_height);
 
     // 1. Header
-    let header = format!(" ◉ flw  {} cmds  (↑↓ or j/k · q quit) ", cmds.len());
+    let header = format!(" ◉ flw  {} cmds  (↑↓ scroll · ←→ inspect · q quit) ", cmds.len());
     let header_line: String = header
         .chars()
         .chain(std::iter::repeat(' '))
@@ -63,16 +94,44 @@ fn render_watch(
     for i in 0..list_height {
         let idx = scroll + i;
         if idx < cmds.len() {
-            let line: String = cmds[idx]
-                .chars()
-                .chain(std::iter::repeat(' '))
-                .take(cols as usize)
-                .collect();
+            let display_cmd = if idx == selected {
+                explanation.formatted_command.as_deref().unwrap_or(&cmds[idx])
+            } else {
+                &cmds[idx]
+            };
+
             if idx == selected {
+                if let Some(match_idx) = active_match_idx {
+                    if match_idx < explanation.matches.len() {
+                        let m = &explanation.matches[match_idx];
+                        let display_text = if explanation.formatted_command.is_some() {
+                            highlight_cmd_source_by_index(display_cmd, m.start, m.end)
+                        } else {
+                            highlight_cmd_source(display_cmd, &m.source)
+                        };
+                        let raw_len = display_cmd.chars().count();
+                        let pad_len = (cols as usize).saturating_sub(raw_len);
+                        let line = format!("\x1b[7m{}{}\x1b[0m", display_text, " ".repeat(pad_len));
+                        out.push_str(&line);
+                        out.push_str("\r\n");
+                        continue;
+                    }
+                }
+                
+                let line: String = display_cmd
+                    .chars()
+                    .chain(std::iter::repeat(' '))
+                    .take(cols as usize)
+                    .collect();
                 out.push_str("\x1b[7m");
                 out.push_str(&line);
                 out.push_str("\x1b[0m");
             } else {
+                let line: String = display_cmd
+                    .chars()
+                    .chain(std::iter::repeat(' '))
+                    .take(cols as usize)
+                    .collect();
                 out.push_str(&line);
             }
         } else {
@@ -93,16 +152,45 @@ fn render_watch(
     out.push_str("\x1b[0m\r\n");
 
     // 4. Explanation (JSON)
-    let exp_lines: Vec<&str> = explanation.lines().collect();
+    let json_str = explainshell::explanation_to_json(explanation, active_match_idx);
+    let exp_lines: Vec<&str> = json_str.lines().collect();
     for i in 0..explanation_height {
         if i < exp_lines.len() {
             let line = exp_lines[i];
-            let truncated: String = line
-                .chars()
-                .take(cols as usize)
-                .collect();
+            
+            // Calculate visual length (excluding ANSI escape sequences)
+            let mut visual_len = 0;
+            let mut in_escape = false;
+            let mut char_count_including_escapes = 0;
+            
+            for c in line.chars() {
+                if c == '\x1b' {
+                    in_escape = true;
+                }
+                
+                if in_escape {
+                    char_count_including_escapes += 1;
+                    if c == 'm' || c == 'K' || c == 'H' || c == 'J' {
+                        in_escape = false;
+                    }
+                } else {
+                    visual_len += 1;
+                    char_count_including_escapes += 1;
+                    if visual_len >= cols as usize {
+                        break;
+                    }
+                }
+            }
+            
+            let truncated: String = line.chars().take(char_count_including_escapes).collect();
             out.push_str(&truncated);
-            let extra = (cols as usize).saturating_sub(line.chars().count());
+            
+            // Safe reset if line ended within red block
+            if line.contains("\x1b[31;1m") && !truncated.contains("\x1b[0m") {
+                out.push_str("\x1b[0m");
+            }
+            
+            let extra = (cols as usize).saturating_sub(visual_len);
             if extra > 0 {
                 out.push_str(&" ".repeat(extra));
             }
@@ -131,11 +219,13 @@ fn watch_mode(trace_path: String) -> Result<()> {
     let mut selected: usize = 0;
     let mut scroll: usize = 0;
     let mut follow = true;
+    let mut active_match_idx: Option<usize> = None;
 
-    // Caching explainshell JSON results
-    let cache = Arc::new(Mutex::new(std::collections::HashMap::<String, String>::new()));
-    let mut last_rendered_explanation: Option<String> = None;
-    let mut last_selected_cmd_text: Option<String> = None;
+    // Caching explainshell Explanation results
+    let cache = Arc::new(Mutex::new(std::collections::HashMap::<String, explainshell::Explanation>::new()));
+    let mut last_selected = usize::MAX;
+    let mut last_active_match_idx: Option<usize> = None;
+    let mut last_cache_status: Option<String> = None;
     let mut last_count = usize::MAX;
 
     loop {
@@ -146,8 +236,8 @@ fn watch_mode(trace_path: String) -> Result<()> {
         };
 
         let mut should_redraw = false;
-        let current_explanation: String;
-        let mut current_cmd_text = None;
+        let current_explanation: explainshell::Explanation;
+        let current_cache_status: String;
 
         let count = {
             let cmds = commands.lock().unwrap();
@@ -173,7 +263,6 @@ fn watch_mode(trace_path: String) -> Result<()> {
         };
 
         if let Some(cmd_text) = selected_cmd {
-            current_cmd_text = Some(cmd_text.clone());
             let cached_opt = {
                 let cache_lock = cache.lock().unwrap();
                 cache_lock.get(&cmd_text).cloned()
@@ -181,50 +270,78 @@ fn watch_mode(trace_path: String) -> Result<()> {
 
             match cached_opt {
                 Some(cached) => {
+                    if let Some(err) = &cached.error {
+                        current_cache_status = format!("error: {}", err);
+                    } else {
+                        current_cache_status = format!("loaded: {}", cached.matches.len());
+                    }
                     current_explanation = cached;
                 }
                 None => {
+                    let loading_exp = explainshell::Explanation {
+                        command: cmd_text.clone(),
+                        error: Some("Loading explanation...".to_string()),
+                        formatted_command: None,
+                        matches: Vec::new(),
+                    };
                     {
                         let mut cache_lock = cache.lock().unwrap();
-                        cache_lock.insert(cmd_text.clone(), "{\n  \"status\": \"Loading explanation...\"\n}".to_string());
+                        cache_lock.insert(cmd_text.clone(), loading_exp.clone());
                     }
-                    current_explanation = "{\n  \"status\": \"Loading explanation...\"\n}".to_string();
+                    current_explanation = loading_exp;
+                    current_cache_status = "loading".to_string();
                     should_redraw = true;
 
                     let cache_clone = Arc::clone(&cache);
                     let cmd_to_fetch = cmd_text.clone();
                     std::thread::spawn(move || {
                         let result = match explainshell::fetch_html(&cmd_to_fetch) {
-                            Ok(html) => explainshell::parse_html_to_json(&cmd_to_fetch, &html),
-                            Err(e) => format!("{{\n  \"error\": \"{}\"\n}}", e),
+                            Ok(html) => explainshell::parse_html(&cmd_to_fetch, &html),
+                            Err(e) => explainshell::Explanation {
+                                command: cmd_to_fetch.clone(),
+                                error: Some(format!("Error: {}", e)),
+                                formatted_command: None,
+                                matches: Vec::new(),
+                            },
                         };
                         cache_clone.lock().unwrap().insert(cmd_to_fetch, result);
                     });
                 }
             }
         } else {
-            current_explanation = "{\n  \"status\": \"No commands recorded yet\"\n}".to_string();
+            let empty_exp = explainshell::Explanation {
+                command: String::new(),
+                error: Some("No commands recorded yet".to_string()),
+                formatted_command: None,
+                matches: Vec::new(),
+            };
+            current_explanation = empty_exp;
+            current_cache_status = "empty".to_string();
         }
 
-        if last_selected_cmd_text != current_cmd_text 
-            || last_rendered_explanation.as_ref() != Some(&current_explanation) 
+        if selected != last_selected 
+            || active_match_idx != last_active_match_idx 
+            || Some(&current_cache_status) != last_cache_status.as_ref() 
             || should_redraw 
         {
             let cmds = commands.lock().unwrap();
-            render_watch(&cmds, selected, scroll, &current_explanation, cols, rows, &mut stdout)?;
-            last_selected_cmd_text = current_cmd_text;
-            last_rendered_explanation = Some(current_explanation.clone());
+            render_watch(&cmds, selected, scroll, &current_explanation, active_match_idx, cols, rows, &mut stdout)?;
+            last_selected = selected;
+            last_active_match_idx = active_match_idx;
+            last_cache_status = Some(current_cache_status);
         }
 
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) => match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
+                        active_match_idx = None;
                         follow = false;
                         selected = selected.saturating_sub(1);
                         scroll = scroll.min(selected);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
+                        active_match_idx = None;
                         let count = commands.lock().unwrap().len();
                         if selected + 1 < count {
                             selected += 1;
@@ -234,12 +351,39 @@ fn watch_mode(trace_path: String) -> Result<()> {
                         }
                         follow = selected + 1 == count;
                     }
-                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        if let Some(m_idx) = active_match_idx {
+                            if m_idx > 0 {
+                                active_match_idx = Some(m_idx - 1);
+                            } else {
+                                active_match_idx = None;
+                            }
+                        }
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        if active_match_idx.is_none() {
+                            if !current_explanation.matches.is_empty() {
+                                active_match_idx = Some(0);
+                            }
+                        } else if let Some(m_idx) = active_match_idx {
+                            if m_idx + 1 < current_explanation.matches.len() {
+                                active_match_idx = Some(m_idx + 1);
+                            }
+                        }
+                    }
+                    KeyCode::Esc => {
+                        if active_match_idx.is_some() {
+                            active_match_idx = None;
+                        } else {
+                            break;
+                        }
+                    }
+                    KeyCode::Char('q') => break,
                     _ => {}
                 },
                 Event::Resize(c, r) => {
                     let cmds = commands.lock().unwrap();
-                    render_watch(&cmds, selected, scroll, &current_explanation, c, r, &mut stdout)?;
+                    render_watch(&cmds, selected, scroll, &current_explanation, active_match_idx, c, r, &mut stdout)?;
                     last_count = cmds.len();
                 }
                 _ => {}

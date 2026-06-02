@@ -1,5 +1,21 @@
 use anyhow::Result;
 
+#[derive(Clone, Debug)]
+pub struct Match {
+    pub index: usize,
+    pub source: String,
+    pub explanation: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct Explanation {
+    pub command: String,
+    pub formatted_command: Option<String>,
+    pub error: Option<String>,
+    pub matches: Vec<Match>,
+}
 
 /// URL encode a string for query parameters.
 fn url_encode(input: &str) -> String {
@@ -128,52 +144,109 @@ fn escape_json(s: &str) -> String {
     escaped
 }
 
-/// Parse the explainshell HTML into a clean, pretty-printed JSON string.
-pub fn parse_html_to_json(cmd: &str, html: &str) -> String {
+fn parse_command_div(html: &str) -> (String, Vec<(usize, usize, String)>) {
+    let mut formatted = String::new();
+    let mut spans = Vec::new();
+    
+    let mut active_help_id = None;
+    let mut active_start = 0;
+    
+    let mut i = 0;
+    let chars: Vec<char> = html.chars().collect();
+    
+    while i < chars.len() {
+        if html[i..].starts_with("<ul class=\"dropdown-menu\"") {
+            if let Some(end) = html[i..].find("</ul>") {
+                i += end + 5;
+                continue;
+            }
+        }
+        
+        if html[i..].starts_with("<span") {
+            if let Some(end) = html[i..].find('>') {
+                let tag = &html[i..=i+end];
+                if let Some(help_idx) = tag.find("helpref=\"") {
+                    let start_quote = help_idx + 9;
+                    if let Some(end_quote) = tag[start_quote..].find('"') {
+                        let help_id = tag[start_quote..start_quote+end_quote].to_string();
+                        active_help_id = Some(help_id);
+                        active_start = formatted.chars().count();
+                    }
+                }
+                i += end + 1;
+                continue;
+            }
+        }
+        
+        if html[i..].starts_with("</span") {
+            if let Some(end) = html[i..].find('>') {
+                if let Some(help_id) = active_help_id.take() {
+                    spans.push((active_start, formatted.chars().count(), help_id));
+                }
+                i += end + 1;
+                continue;
+            }
+        }
+        
+        if html[i..].starts_with('<') {
+            if let Some(end) = html[i..].find('>') {
+                i += end + 1;
+                continue;
+            }
+        }
+        
+        if html[i..].starts_with("&amp;") { formatted.push('&'); i += 5; continue; }
+        if html[i..].starts_with("&lt;") { formatted.push('<'); i += 4; continue; }
+        if html[i..].starts_with("&gt;") { formatted.push('>'); i += 4; continue; }
+        if html[i..].starts_with("&quot;") { formatted.push('"'); i += 6; continue; }
+        if html[i..].starts_with("&#39;") { formatted.push('\''); i += 5; continue; }
+        
+        let c = chars[i];
+        if c == '\n' || c == '\r' || c.is_whitespace() {
+            if !formatted.is_empty() && !formatted.ends_with(' ') {
+                formatted.push(' ');
+            }
+        } else {
+            formatted.push(c);
+        }
+        i += 1;
+    }
+    
+    (formatted.trim().to_string(), spans)
+}
+
+/// Parse the explainshell HTML into a clean structured Explanation.
+pub fn parse_html(cmd: &str, html: &str) -> Explanation {
     // Check for common error pages first
     if html.contains("missing man page") {
-        return format!(
-            r#"{{
-  "command": "{}",
-  "error": "missing man page"
-}}"#,
-            escape_json(cmd)
-        );
+        return Explanation {
+            command: cmd.to_string(),
+            formatted_command: None,
+            error: Some("missing man page".to_string()),
+            matches: Vec::new(),
+        };
     }
     if html.contains("parsing error") {
-        return format!(
-            r#"{{
-  "command": "{}",
-  "error": "parsing error"
-}}"#,
-            escape_json(cmd)
-        );
+        return Explanation {
+            command: cmd.to_string(),
+            formatted_command: None,
+            error: Some("parsing error".to_string()),
+            matches: Vec::new(),
+        };
     }
 
-    // 1. Parse spans from <div id="command">...</div>
-    let mut spans = Vec::new();
+    // 1. Parse formatted command and spans from <div id="command">...</div>
+    let mut formatted_command = None;
+    let mut formatted_spans = Vec::new();
     if let Some(cmd_start) = html.find("id=\"command\"") {
         if let Some(cmd_fragment_start) = html[cmd_start..].find('>') {
             let abs_start = cmd_start + cmd_fragment_start + 1;
             if let Some(cmd_end) = html[abs_start..].find("</div>") {
                 let fragment = &html[abs_start..abs_start + cmd_end];
-                let mut search_idx = 0;
-                while let Some(span_start) = fragment[search_idx..].find("helpref=\"") {
-                    let start_pos = search_idx + span_start + 9;
-                    if let Some(ref_end) = fragment[start_pos..].find('"') {
-                        let ref_id = &fragment[start_pos..start_pos + ref_end];
-                        if let Some(tag_end) = fragment[start_pos + ref_end..].find('>') {
-                            let content_start = start_pos + ref_end + tag_end + 1;
-                            if let Some(span_end) = fragment[content_start..].find("</span>") {
-                                let inner_html = &fragment[content_start..content_start + span_end];
-                                let clean_text = strip_html_tags(inner_html);
-                                spans.push((clean_text, ref_id.to_string()));
-                                search_idx = content_start + span_end + 7;
-                                continue;
-                            }
-                        }
-                    }
-                    search_idx += span_start + 9;
+                let (f, s) = parse_command_div(fragment);
+                if !f.is_empty() {
+                    formatted_command = Some(f);
+                    formatted_spans = s;
                 }
             }
         }
@@ -200,34 +273,82 @@ pub fn parse_html_to_json(cmd: &str, html: &str) -> String {
         search_idx += div_start + 26;
     }
 
-    // 3. Assemble JSON manually
-    let mut matches_json = Vec::new();
-    for (span_text, ref_id) in &spans {
+    // 3. Assemble matches
+    let mut matches = Vec::new();
+    let mut idx = 0;
+    for (start, end, ref_id) in &formatted_spans {
         if let Some((_, help_text)) = help_boxes.iter().find(|(h_id, _)| h_id == ref_id) {
-            let escaped_span = escape_json(span_text);
-            let escaped_help = escape_json(help_text);
-            matches_json.push(format!(
-                r#"    {{
-      "source": "{}",
-      "explanation": "{}"
-    }}"#,
-                escaped_span, escaped_help
-            ));
+            let source: String = if let Some(ref f) = formatted_command {
+                f.chars().skip(*start).take(end - start).collect()
+            } else {
+                ref_id.clone()
+            };
+            matches.push(Match {
+                index: idx,
+                source,
+                explanation: help_text.clone(),
+                start: *start,
+                end: *end,
+            });
+            idx += 1;
         }
     }
 
-    // If we couldn't match spans (e.g. different HTML structure), just list the help boxes!
-    if matches_json.is_empty() {
+    // If we couldn't match spans (e.g. different HTML structure), just list the help boxes directly!
+    if matches.is_empty() {
         for (id, help_text) in &help_boxes {
-            let escaped_id = escape_json(id);
-            let escaped_help = escape_json(help_text);
-            matches_json.push(format!(
-                r#"    {{
+            matches.push(Match {
+                index: idx,
+                source: id.clone(),
+                explanation: help_text.clone(),
+                start: 0,
+                end: 0,
+            });
+            idx += 1;
+        }
+    }
+
+    Explanation {
+        command: cmd.to_string(),
+        formatted_command,
+        error: None,
+        matches,
+    }
+}
+
+/// Convert an Explanation to a clean JSON string, highlighting the specified match index in bold red.
+pub fn explanation_to_json(exp: &Explanation, highlight_idx: Option<usize>) -> String {
+    if let Some(err) = &exp.error {
+        return format!(
+            r#"{{
+  "command": "{}",
+  "error": "{}"
+}}"#,
+            escape_json(&exp.command),
+            escape_json(err)
+        );
+    }
+
+    let mut matches_json = Vec::new();
+    for m in &exp.matches {
+        let is_highlighted = Some(m.index) == highlight_idx;
+        let escaped_source = escape_json(&m.source);
+        let escaped_help = escape_json(&m.explanation);
+        
+        let block = format!(
+            r#"    {{
+      "index": {},
       "source": "{}",
       "explanation": "{}"
     }}"#,
-                escaped_id, escaped_help
-            ));
+            m.index, escaped_source, escaped_help
+        );
+
+        if is_highlighted {
+            // Light it up in red (\x1b[31;1m ... \x1b[0m)
+            matches_json.push(format!("\x1b[31;1m{}\x1b[0m", block));
+        } else {
+            matches_json.push(block);
         }
     }
 
@@ -238,7 +359,7 @@ pub fn parse_html_to_json(cmd: &str, html: &str) -> String {
 {}
   ]
 }}"#,
-        escape_json(cmd),
+        escape_json(&exp.command),
         matches_json.join(",\n")
     )
 }
