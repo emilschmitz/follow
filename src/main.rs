@@ -564,3 +564,41 @@ fn main() -> Result<()> {
 
     launch_mode(agent_name, extra_args)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_shopt_wrapper() {
+        // 1. Unwrapped command
+        assert_eq!(strip_shopt_wrapper("ls -la"), "ls -la");
+
+        // 2. Wrapped command with no extra trailing noise (just the parenthesis)
+        assert_eq!(
+            strip_shopt_wrapper("shopt -u promptvars nullglob extglob nocaseglob dotglob; ( echo hello )"),
+            "echo hello"
+        );
+
+        // 3. Wrapped command with __code exiting noise
+        let complex = r#"shopt -u promptvars nullglob extglob nocaseglob dotglob; ( ls -R && touch complex_demo_file.txt && echo "success." ) __code=$?; pgrep -g 0 >/tmp/gemini-shell-Neupw6/pgrep.tmp 2>&1; exit $__code;"#;
+        assert_eq!(
+            strip_shopt_wrapper(complex),
+            r#"ls -R && touch complex_demo_file.txt && echo "success.""#
+        );
+
+        // 4. Wrapped command with a subshell inside the command itself
+        let nested = r#"shopt -u promptvars nullglob extglob nocaseglob dotglob; ( (echo "nested") ) __code=$?;"#;
+        assert_eq!(
+            strip_shopt_wrapper(nested),
+            r#"(echo "nested")"#
+        );
+        
+        // 5. With newline variations in the trailing noise
+        let newlines = "shopt -u promptvars nullglob extglob nocaseglob dotglob; ( echo multiline )\n__code=$?; pgrep";
+        assert_eq!(
+            strip_shopt_wrapper(newlines),
+            "echo multiline"
+        );
+    }
+}
