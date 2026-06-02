@@ -1,0 +1,279 @@
+use anyhow::Result;
+use crossterm::{
+    event::{self, Event, KeyCode},
+    terminal::{disable_raw_mode, enable_raw_mode, size},
+};
+use std::{
+    io::{self, Write},
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+mod snoop;
+
+// ── Terminal cleanup ──────────────────────────────────────────────────────────
+
+struct TerminalRestorer;
+impl Drop for TerminalRestorer {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = write!(io::stdout(), "\x1b[?25h\x1b[0m");
+        let _ = io::stdout().flush();
+    }
+}
+
+// ── Watch mode (right-pane TUI) ───────────────────────────────────────────────
+
+fn render_watch(
+    cmds: &[String],
+    selected: usize,
+    scroll: usize,
+    cols: u16,
+    rows: u16,
+    stdout: &mut io::Stdout,
+) -> Result<()> {
+    let mut out = String::with_capacity(4096);
+    out.push_str("\x1b[H\x1b[2J\x1b[?25l");
+
+    let header = format!(" ◉ flw  {} cmds  (↑↓ or j/k · q quit) ", cmds.len());
+    let header_line: String = header
+        .chars()
+        .chain(std::iter::repeat(' '))
+        .take(cols as usize)
+        .collect();
+    out.push_str("\x1b[7m");
+    out.push_str(&header_line);
+    out.push_str("\x1b[0m\r\n");
+
+    let visible = rows.saturating_sub(1) as usize;
+    for i in 0..visible {
+        let idx = scroll + i;
+        if idx < cmds.len() {
+            let line: String = cmds[idx]
+                .chars()
+                .chain(std::iter::repeat(' '))
+                .take(cols as usize)
+                .collect();
+            if idx == selected {
+                out.push_str("\x1b[7m");
+                out.push_str(&line);
+                out.push_str("\x1b[0m");
+            } else {
+                out.push_str(&line);
+            }
+        } else {
+            out.push_str(&" ".repeat(cols as usize));
+        }
+        if i < visible - 1 {
+            out.push_str("\r\n");
+        }
+    }
+
+    out.push_str("\x1b[?25h");
+    stdout.write_all(out.as_bytes())?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn watch_mode(trace_path: String) -> Result<()> {
+    let commands: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    snoop::start_from_file(trace_path, Arc::clone(&commands));
+
+    enable_raw_mode()?;
+    let _restorer = TerminalRestorer;
+    let mut stdout = io::stdout();
+
+    let mut selected: usize = 0;
+    let mut scroll: usize = 0;
+    let mut follow = true;
+    let mut last_count = usize::MAX; // force first render
+
+    loop {
+        let (cols, rows) = size()?;
+        let visible = rows.saturating_sub(1) as usize;
+
+        {
+            let cmds = commands.lock().unwrap();
+            let count = cmds.len();
+            if count != last_count {
+                if follow && count > 0 {
+                    scroll = count.saturating_sub(visible);
+                    selected = count - 1;
+                }
+                render_watch(&cmds, selected, scroll, cols, rows, &mut stdout)?;
+                last_count = count;
+            }
+        }
+
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Key(key) => match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        follow = false;
+                        selected = selected.saturating_sub(1);
+                        scroll = scroll.min(selected);
+                        let cmds = commands.lock().unwrap();
+                        render_watch(&cmds, selected, scroll, cols, rows, &mut stdout)?;
+                        last_count = cmds.len();
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let count = commands.lock().unwrap().len();
+                        if selected + 1 < count {
+                            selected += 1;
+                        }
+                        if selected >= scroll + visible {
+                            scroll = selected + 1 - visible;
+                        }
+                        follow = selected + 1 == count;
+                        let cmds = commands.lock().unwrap();
+                        render_watch(&cmds, selected, scroll, cols, rows, &mut stdout)?;
+                        last_count = cmds.len();
+                    }
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    _ => {}
+                },
+                Event::Resize(c, r) => {
+                    let cmds = commands.lock().unwrap();
+                    render_watch(&cmds, selected, scroll, c, r, &mut stdout)?;
+                    last_count = cmds.len();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    write!(stdout, "\x1b[2J\x1b[H")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+// ── Launch mode ───────────────────────────────────────────────────────────────
+
+/// Single-quote a shell argument safely.
+fn sq(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Find the real path of a shell binary, ignoring our wrapper dir.
+/// Looks in /bin, /usr/bin only.
+fn real_shell(name: &str) -> PathBuf {
+    for dir in ["/bin", "/usr/bin", "/usr/local/bin"] {
+        let p = PathBuf::from(dir).join(name);
+        if p.exists() {
+            return p;
+        }
+    }
+    PathBuf::from(format!("/bin/{}", name))
+}
+
+/// Write a tiny wrapper script that logs the -c argument then exec's the real shell.
+fn write_wrapper(path: PathBuf, real: &PathBuf, trace: &PathBuf) -> Result<()> {
+    // Using printf instead of echo to avoid issues with special chars.
+    // The wrapper is deliberately tiny — no bashisms, pure POSIX sh.
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"-c\" ] && [ -n \"$2\" ]; then printf '%s\\n' \"$2\" >> {} 2>/dev/null; fi\nexec {} \"$@\"\n",
+        sq(&trace.to_string_lossy()),
+        sq(&real.to_string_lossy()),
+    );
+    std::fs::write(&path, &script)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+fn launch_mode(agent_name: String, extra_args: Vec<String>) -> Result<()> {
+    let agent_path = which::which(&agent_name)
+        .unwrap_or_else(|_| panic!("'{}' not found in PATH", agent_name));
+
+    let pid = std::process::id();
+    let wrapper_dir = PathBuf::from(format!("/tmp/flw_{}_bin", pid));
+    let trace_path = PathBuf::from(format!("/tmp/flw_{}.trace", pid));
+    let flw_bin = std::env::current_exe()?;
+    let in_tmux = std::env::var("TMUX").is_ok();
+    let window_name = format!("flw-{}", agent_name);
+
+    // Create bash and sh wrappers that log -c commands to the trace file
+    std::fs::create_dir_all(&wrapper_dir)?;
+    write_wrapper(wrapper_dir.join("bash"), &real_shell("bash"), &trace_path)?;
+    write_wrapper(wrapper_dir.join("sh"), &real_shell("sh"), &trace_path)?;
+
+    // Left pane: agent runs normally, just with our wrapper dir prepended to PATH
+    let extra: String = extra_args.iter().map(|a| format!(" {}", sq(a))).collect();
+
+
+    // Right pane: flw --watch <trace>
+    let right_cmd = format!(
+        "{} --watch {}",
+        sq(&flw_bin.to_string_lossy()),
+        sq(&trace_path.to_string_lossy()),
+    );
+
+    // Ctrl+F toggle using tmux's native if-shell command.
+    // if-shell runs a shell condition, then dispatches one of two tmux commands.
+    // Unlike run-shell, it produces no output in the pane.
+    let open_pane = format!("split-window -h {}", sq(&right_cmd));
+    std::process::Command::new("tmux")
+        .args([
+            "bind-key", "-n", "C-f",
+            "if-shell", "[ $(tmux list-panes | wc -l) -eq 1 ]",
+            &open_pane,
+            "kill-pane -t :.1",
+        ])
+        .status()?;
+
+    // Also clean up the C-f binding when agi exits
+    let cleanup = format!(
+        "; tmux unbind-key -n C-f 2>/dev/null; rm -rf {} {}",
+        sq(&wrapper_dir.to_string_lossy()),
+        sq(&trace_path.to_string_lossy()),
+    );
+    let left_cmd = format!(
+        "PATH={}:$PATH {}{}{}",
+        sq(&wrapper_dir.to_string_lossy()),
+        sq(&agent_path.to_string_lossy()),
+        extra,
+        cleanup,
+    );
+
+    if in_tmux {
+        // Create a new window in the existing session (no nesting)
+        std::process::Command::new("tmux")
+            .args(["new-window", "-n", &window_name, &left_cmd])
+            .status()?;
+        // Focus is already on the new window; flw exits here
+    } else {
+        // Not in tmux — create a session and attach
+        let session = format!("flw_{}", pid);
+        std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &session, &left_cmd])
+            .status()?;
+        std::process::Command::new("tmux")
+            .args(["select-pane", "-t", &format!("{}:0.0", session)])
+            .status()?;
+        std::process::Command::new("tmux")
+            .args(["attach-session", "-t", &session])
+            .status()?;
+    }
+
+    Ok(())
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+fn main() -> Result<()> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+
+    if argv.first().map(String::as_str) == Some("--watch") {
+        let trace = argv.get(1).cloned().expect("flw --watch <trace_file>");
+        return watch_mode(trace);
+    }
+
+    let agent_name = argv
+        .first()
+        .cloned()
+        .expect("Usage: flw <agent>  e.g.  flw agi");
+    let extra_args = argv[1..].to_vec();
+
+    launch_mode(agent_name, extra_args)
+}

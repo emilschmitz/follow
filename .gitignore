@@ -1,0 +1,32 @@
+# Rust build artifacts
+/target/
+
+# Environment files — never commit secrets or API keys
+.env
+.env.*
+*.env
+secrets.env
+
+# OS junk
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.direnv/
+.envrc
+
+# Runtime temp files flw creates (normally in /tmp, but just in case)
+*.trace
+flw_*_bin/
+
+# Crash / debug artifacts
+*.log
