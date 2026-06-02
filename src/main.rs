@@ -238,9 +238,10 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
         let current_status_str = selected_status.map_or("running".to_string(), |s| s.to_string());
 
         if let Some(cmd_text) = selected_cmd {
+            let cmd_to_fetch = strip_shopt_wrapper(&cmd_text);
             let cached_opt = {
                 let cache_lock = cache.lock().unwrap();
-                cache_lock.get(&cmd_text).cloned()
+                cache_lock.get(&cmd_to_fetch).cloned()
             };
 
             match cached_opt {
@@ -254,32 +255,32 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
                 }
                 None => {
                     let loading_exp = explainshell::Explanation {
-                        command: cmd_text.clone(),
+                        command: cmd_to_fetch.clone(),
                         error: Some("Loading explanation...".to_string()),
                         formatted_command: None,
                         matches: Vec::new(),
                     };
                     {
                         let mut cache_lock = cache.lock().unwrap();
-                        cache_lock.insert(cmd_text.clone(), loading_exp.clone());
+                        cache_lock.insert(cmd_to_fetch.clone(), loading_exp.clone());
                     }
                     current_explanation = loading_exp;
                     current_cache_status = format!("loading ({})", current_status_str);
                     should_redraw = true;
 
                     let cache_clone = Arc::clone(&cache);
-                    let cmd_to_fetch = strip_shopt_wrapper(&cmd_text);
+                    let fetch_cmd = cmd_to_fetch.clone();
                     std::thread::spawn(move || {
-                        let result = match explainshell::fetch_html(&cmd_to_fetch) {
-                            Ok(html) => explainshell::parse_html(&cmd_to_fetch, &html),
+                        let result = match explainshell::fetch_html(&fetch_cmd) {
+                            Ok(html) => explainshell::parse_html(&fetch_cmd, &html),
                             Err(e) => explainshell::Explanation {
-                                command: cmd_to_fetch.clone(),
+                                command: fetch_cmd.clone(),
                                 error: Some(format!("Error: {}", e)),
                                 formatted_command: None,
                                 matches: Vec::new(),
                             },
                         };
-                        cache_clone.lock().unwrap().insert(cmd_to_fetch, result);
+                        cache_clone.lock().unwrap().insert(fetch_cmd, result);
                     });
                 }
             }
