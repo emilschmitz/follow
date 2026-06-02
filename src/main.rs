@@ -145,6 +145,8 @@ fn render_list(
 }
 
 fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
+    let _ = std::fs::write(&json_path, ""); // Ensure file exists to reset missing_count
+    
     let commands: Arc<Mutex<Vec<snoop::Command>>> = Arc::new(Mutex::new(Vec::new()));
     snoop::start_from_file(trace_path, Arc::clone(&commands));
 
@@ -344,26 +346,39 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
 
     write!(stdout, "\x1b[2J\x1b[H")?;
     stdout.flush()?;
+    let _ = std::fs::remove_file(&json_path);
     Ok(())
 }
 
 fn watch_json_mode(json_path: String) -> Result<()> {
     let mut last_content = String::new();
+    let mut missing_count = 0;
     
     // Clear screen on start
     print!("\x1b[H\x1b[2J");
     io::stdout().flush()?;
     
     loop {
-        if let Ok(content) = std::fs::read_to_string(&json_path) {
-            if content != last_content {
-                print!("\x1b[H\x1b[2J{}", content);
-                io::stdout().flush()?;
-                last_content = content;
+        match std::fs::read_to_string(&json_path) {
+            Ok(content) => {
+                missing_count = 0;
+                if content != last_content {
+                    print!("\x1b[H\x1b[2J{}", content);
+                    io::stdout().flush()?;
+                    last_content = content;
+                }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                missing_count += 1;
+                if missing_count > 10 {
+                    break;
+                }
+            }
+            Err(_) => {}
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    Ok(())
 }
 
 
@@ -438,29 +453,31 @@ fn launch_mode(agent_name: String, extra_args: Vec<String>) -> Result<()> {
         sq(&json_path.to_string_lossy()),
     );
 
-    // split-window -h creates right pane. split-window -v creates bottom right pane.
-    let open_pane = format!(
-        "split-window -h {} \\; split-window -v {}",
+    let toggle_script_path = PathBuf::from(format!("/tmp/flw_{}_toggle.sh", pid));
+    let toggle_script = format!(
+        "#!/bin/sh\nif [ \"$(tmux list-panes | wc -l)\" -eq 1 ]; then\n  tmux split-window -h {}\n  tmux split-window -v {}\nelse\n  tmux kill-pane -a -t 0\nfi\n",
         sq(&right_top_cmd),
         sq(&right_bottom_cmd)
     );
+    std::fs::write(&toggle_script_path, &toggle_script)?;
+    std::fs::set_permissions(&toggle_script_path, std::fs::Permissions::from_mode(0o755))?;
 
-    // Ctrl+F toggle using tmux's native if-shell command.
+    // Ctrl+F toggle using a dedicated shell script to avoid escaping hell
     std::process::Command::new("tmux")
         .args([
             "bind-key", "-n", "C-f",
-            "if-shell", "[ $(tmux list-panes | wc -l) -eq 1 ]",
-            &open_pane,
-            "kill-pane -a -t 0",
+            "run-shell",
+            &toggle_script_path.to_string_lossy(),
         ])
         .status()?;
 
     // Also clean up the C-f binding when agi exits
     let cleanup = format!(
-        "; tmux unbind-key -n C-f 2>/dev/null; rm -rf {} {} {}",
+        "; tmux unbind-key -n C-f 2>/dev/null; rm -rf {} {} {} {}",
         sq(&wrapper_dir.to_string_lossy()),
         sq(&trace_path.to_string_lossy()),
         sq(&json_path.to_string_lossy()),
+        sq(&toggle_script_path.to_string_lossy()),
     );
     let left_cmd = format!(
         "PATH={}:$PATH {}{}{}",
