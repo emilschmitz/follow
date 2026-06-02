@@ -154,7 +154,8 @@ fn render_watch(
 
     // 4. Explanation (JSON)
     let active_status = cmds.get(selected).and_then(|c| c.status);
-    let json_str = explainshell::explanation_to_json(explanation, active_match_idx, active_status);
+    let active_pid = cmds.get(selected).map(|c| c.id);
+    let json_str = explainshell::explanation_to_json(explanation, active_match_idx, active_status, active_pid);
 
     let exp_lines: Vec<&str> = json_str.lines().collect();
     for i in 0..explanation_height {

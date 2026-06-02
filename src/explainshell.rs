@@ -317,11 +317,17 @@ pub fn parse_html(cmd: &str, html: &str) -> Explanation {
 }
 
 /// Convert an Explanation to a clean JSON string, highlighting the specified match index in bold red.
-pub fn explanation_to_json(exp: &Explanation, active_match_idx: Option<usize>, status: Option<i32>) -> String {
-    let mut status_json = String::new();
+pub fn explanation_to_json(exp: &Explanation, active_match_idx: Option<usize>, status: Option<i32>, pid: Option<u32>) -> String {
+    let mut meta_json = String::new();
+    if let Some(p) = pid {
+        if p > 0 {
+            meta_json.push_str(&format!(r#",
+  "pid": {}"#, p));
+        }
+    }
     if let Some(code) = status {
-        status_json = format!(r#",
-  "status": {}"#, code);
+        meta_json.push_str(&format!(r#",
+  "status": {}"#, code));
     }
 
     if let Some(err) = &exp.error {
@@ -331,7 +337,7 @@ pub fn explanation_to_json(exp: &Explanation, active_match_idx: Option<usize>, s
   "error": "{}"
 }}"#,
             escape_json(&exp.command),
-            status_json,
+            meta_json,
             escape_json(err)
         );
     }
@@ -367,7 +373,7 @@ pub fn explanation_to_json(exp: &Explanation, active_match_idx: Option<usize>, s
   ]
 }}"#,
         escape_json(&exp.command),
-        status_json,
+        meta_json,
         matches_json.join(",\n")
     )
 }
