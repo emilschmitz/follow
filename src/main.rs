@@ -11,7 +11,9 @@ use std::{
     time::Duration,
 };
 
+mod explainshell;
 mod snoop;
+
 
 // ── Terminal cleanup ──────────────────────────────────────────────────────────
 
@@ -30,13 +32,23 @@ fn render_watch(
     cmds: &[String],
     selected: usize,
     scroll: usize,
+    explanation: &str,
     cols: u16,
     rows: u16,
     stdout: &mut io::Stdout,
 ) -> Result<()> {
-    let mut out = String::with_capacity(4096);
+    let mut out = String::with_capacity(8192);
     out.push_str("\x1b[H\x1b[2J\x1b[?25l");
 
+    let header_height = 1;
+    let separator_height = 1;
+    
+    // Calculate list height (40% of rows, min 5, max rows - 6)
+    let total_rows = rows as usize;
+    let list_height = (total_rows * 40 / 100).max(5).min(total_rows.saturating_sub(6));
+    let explanation_height = total_rows.saturating_sub(list_height + header_height + separator_height);
+
+    // 1. Header
     let header = format!(" ◉ flw  {} cmds  (↑↓ or j/k · q quit) ", cmds.len());
     let header_line: String = header
         .chars()
@@ -47,8 +59,8 @@ fn render_watch(
     out.push_str(&header_line);
     out.push_str("\x1b[0m\r\n");
 
-    let visible = rows.saturating_sub(1) as usize;
-    for i in 0..visible {
+    // 2. Command List
+    for i in 0..list_height {
         let idx = scroll + i;
         if idx < cmds.len() {
             let line: String = cmds[idx]
@@ -66,7 +78,38 @@ fn render_watch(
         } else {
             out.push_str(&" ".repeat(cols as usize));
         }
-        if i < visible - 1 {
+        out.push_str("\r\n");
+    }
+
+    // 3. Separator
+    let sep_title = " 🧭 ExplainShell JSON ";
+    let sep_line: String = sep_title
+        .chars()
+        .chain(std::iter::repeat('─'))
+        .take(cols as usize)
+        .collect();
+    out.push_str("\x1b[36m"); // Cyan color for separator
+    out.push_str(&sep_line);
+    out.push_str("\x1b[0m\r\n");
+
+    // 4. Explanation (JSON)
+    let exp_lines: Vec<&str> = explanation.lines().collect();
+    for i in 0..explanation_height {
+        if i < exp_lines.len() {
+            let line = exp_lines[i];
+            let truncated: String = line
+                .chars()
+                .take(cols as usize)
+                .collect();
+            out.push_str(&truncated);
+            let extra = (cols as usize).saturating_sub(line.chars().count());
+            if extra > 0 {
+                out.push_str(&" ".repeat(extra));
+            }
+        } else {
+            out.push_str(&" ".repeat(cols as usize));
+        }
+        if i < explanation_height - 1 {
             out.push_str("\r\n");
         }
     }
@@ -88,23 +131,89 @@ fn watch_mode(trace_path: String) -> Result<()> {
     let mut selected: usize = 0;
     let mut scroll: usize = 0;
     let mut follow = true;
-    let mut last_count = usize::MAX; // force first render
+
+    // Caching explainshell JSON results
+    let cache = Arc::new(Mutex::new(std::collections::HashMap::<String, String>::new()));
+    let mut last_rendered_explanation: Option<String> = None;
+    let mut last_selected_cmd_text: Option<String> = None;
+    let mut last_count = usize::MAX;
 
     loop {
         let (cols, rows) = size()?;
-        let visible = rows.saturating_sub(1) as usize;
+        let visible_list_rows = {
+            let total_rows = rows as usize;
+            (total_rows * 40 / 100).max(5).min(total_rows.saturating_sub(6))
+        };
 
+        let mut should_redraw = false;
+        let current_explanation: String;
+        let mut current_cmd_text = None;
+
+        let count = {
+            let cmds = commands.lock().unwrap();
+            cmds.len()
+        };
+
+        if count != last_count {
+            should_redraw = true;
+            if follow && count > 0 {
+                scroll = count.saturating_sub(visible_list_rows);
+                selected = count - 1;
+            }
+            last_count = count;
+        }
+
+        let selected_cmd = {
+            let cmds = commands.lock().unwrap();
+            if selected < cmds.len() {
+                Some(cmds[selected].clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(cmd_text) = selected_cmd {
+            current_cmd_text = Some(cmd_text.clone());
+            let cached_opt = {
+                let cache_lock = cache.lock().unwrap();
+                cache_lock.get(&cmd_text).cloned()
+            };
+
+            match cached_opt {
+                Some(cached) => {
+                    current_explanation = cached;
+                }
+                None => {
+                    {
+                        let mut cache_lock = cache.lock().unwrap();
+                        cache_lock.insert(cmd_text.clone(), "{\n  \"status\": \"Loading explanation...\"\n}".to_string());
+                    }
+                    current_explanation = "{\n  \"status\": \"Loading explanation...\"\n}".to_string();
+                    should_redraw = true;
+
+                    let cache_clone = Arc::clone(&cache);
+                    let cmd_to_fetch = cmd_text.clone();
+                    std::thread::spawn(move || {
+                        let result = match explainshell::fetch_html(&cmd_to_fetch) {
+                            Ok(html) => explainshell::parse_html_to_json(&cmd_to_fetch, &html),
+                            Err(e) => format!("{{\n  \"error\": \"{}\"\n}}", e),
+                        };
+                        cache_clone.lock().unwrap().insert(cmd_to_fetch, result);
+                    });
+                }
+            }
+        } else {
+            current_explanation = "{\n  \"status\": \"No commands recorded yet\"\n}".to_string();
+        }
+
+        if last_selected_cmd_text != current_cmd_text 
+            || last_rendered_explanation.as_ref() != Some(&current_explanation) 
+            || should_redraw 
         {
             let cmds = commands.lock().unwrap();
-            let count = cmds.len();
-            if count != last_count {
-                if follow && count > 0 {
-                    scroll = count.saturating_sub(visible);
-                    selected = count - 1;
-                }
-                render_watch(&cmds, selected, scroll, cols, rows, &mut stdout)?;
-                last_count = count;
-            }
+            render_watch(&cmds, selected, scroll, &current_explanation, cols, rows, &mut stdout)?;
+            last_selected_cmd_text = current_cmd_text;
+            last_rendered_explanation = Some(current_explanation.clone());
         }
 
         if event::poll(Duration::from_millis(50))? {
@@ -114,29 +223,23 @@ fn watch_mode(trace_path: String) -> Result<()> {
                         follow = false;
                         selected = selected.saturating_sub(1);
                         scroll = scroll.min(selected);
-                        let cmds = commands.lock().unwrap();
-                        render_watch(&cmds, selected, scroll, cols, rows, &mut stdout)?;
-                        last_count = cmds.len();
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         let count = commands.lock().unwrap().len();
                         if selected + 1 < count {
                             selected += 1;
                         }
-                        if selected >= scroll + visible {
-                            scroll = selected + 1 - visible;
+                        if selected >= scroll + visible_list_rows {
+                            scroll = selected + 1 - visible_list_rows;
                         }
                         follow = selected + 1 == count;
-                        let cmds = commands.lock().unwrap();
-                        render_watch(&cmds, selected, scroll, cols, rows, &mut stdout)?;
-                        last_count = cmds.len();
                     }
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     _ => {}
                 },
                 Event::Resize(c, r) => {
                     let cmds = commands.lock().unwrap();
-                    render_watch(&cmds, selected, scroll, c, r, &mut stdout)?;
+                    render_watch(&cmds, selected, scroll, &current_explanation, c, r, &mut stdout)?;
                     last_count = cmds.len();
                 }
                 _ => {}
@@ -148,6 +251,7 @@ fn watch_mode(trace_path: String) -> Result<()> {
     stdout.flush()?;
     Ok(())
 }
+
 
 // ── Launch mode ───────────────────────────────────────────────────────────────
 
