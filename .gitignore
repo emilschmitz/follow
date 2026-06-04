@@ -27,6 +27,8 @@ Desktop.ini
 # Runtime temp files flw creates (normally in /tmp, but just in case)
 *.trace
 flw_*_bin/
+test_parse
 
 # Crash / debug artifacts
 *.log
+scratch/
