@@ -984,6 +984,9 @@ fn launch_mode(agent_name: String, extra_args: Vec<String>, raw_json: bool) -> R
             .args(["new-session", "-d", "-s", &session, &left_cmd])
             .status()?;
         std::process::Command::new("tmux")
+            .args(["set-option", "-t", &session, "status", "off"])
+            .status()?;
+        std::process::Command::new("tmux")
             .args(["select-pane", "-t", &format!("{}:0.0", session)])
             .status()?;
         std::process::Command::new("tmux")
