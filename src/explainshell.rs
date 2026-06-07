@@ -41,12 +41,15 @@ fn is_valid_response(html: &str) -> bool {
 }
 
 /// Fetch the HTML content of the explainshell page for a given command.
-/// Tries the local instance at localhost:5000 first, and falls back to explainshell.com.
 pub fn fetch_html(cmd: &str) -> Result<String> {
     let encoded = url_encode(cmd);
+    let port = std::env::var("EXPLAINSHELL_PORT")
+        .ok()
+        .and_then(|val| val.parse::<u16>().ok())
+        .unwrap_or(5000);
     
-    // Try localhost:5000 first
-    let local_url = format!("http://localhost:5000/explain?cmd={}", encoded);
+    // Try local instance first
+    let local_url = format!("http://localhost:{}/explain?cmd={}", port, encoded);
     if let Ok(output) = std::process::Command::new("curl")
         .args(["-s", "-S", "--max-time", "2", &local_url])
         .output()

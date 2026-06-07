@@ -706,9 +706,9 @@ fn format_lines(content: &str, raw_json: bool, cols: u16) -> Vec<String> {
         let avail_width = (cols as usize).saturating_sub(left_width + 2);
         
         let cleaned_raw = clean_explanation(&m.explanation);
-        let rendered = render_html(&cleaned_raw, 500);
+        let stripped = explainshell::strip_html_tags(&cleaned_raw);
         
-        let desc = get_first_description_line(&rendered);
+        let desc = get_first_description_line(&stripped);
         let truncated_exp = truncate_to_line(&desc, avail_width);
         
         if is_active {
@@ -830,7 +830,65 @@ fn write_wrapper(path: PathBuf, real: &PathBuf, trace: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn get_explainshell_port() -> u16 {
+    std::env::var("EXPLAINSHELL_PORT")
+        .ok()
+        .and_then(|val| val.parse().ok())
+        .unwrap_or(5000)
+}
+
+fn is_explainshell_running(port: u16) -> bool {
+    let addr_str = format!("127.0.0.1:{}", port);
+    if let Ok(addr) = addr_str.parse() {
+        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+    } else {
+        false
+    }
+}
+
+fn find_explainshell_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok().map(PathBuf::from)?;
+    let candidates = [
+        home.join("scratch/explainshell"),
+        home.join("explainshell"),
+        home.join("projects/explainshell"),
+    ];
+    for path in &candidates {
+        if path.join("runserver.py").exists() {
+            return Some(path.clone());
+        }
+    }
+    None
+}
+
+fn start_explainshell(dir: &PathBuf, port: u16) {
+    let python_path = if dir.join(".venv/bin/python").exists() {
+        dir.join(".venv/bin/python")
+    } else {
+        PathBuf::from("python")
+    };
+    
+    let _ = std::process::Command::new(python_path)
+        .arg("runserver.py")
+        .current_dir(dir)
+        .env("DB_PATH", "explainshell.db")
+        .env("PORT", port.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 fn launch_mode(agent_name: String, extra_args: Vec<String>, raw_json: bool) -> Result<()> {
+    let port = get_explainshell_port();
+    if !is_explainshell_running(port) {
+        if let Some(dir) = find_explainshell_dir() {
+            println!("\x1b[33mStarting local explainshell server on localhost:{}...\x1b[0m", port);
+            start_explainshell(&dir, port);
+            std::thread::sleep(Duration::from_millis(800));
+        }
+    }
+
     let agent_path = which::which(&agent_name)
         .unwrap_or_else(|_| panic!("'{}' not found in PATH", agent_name));
 
