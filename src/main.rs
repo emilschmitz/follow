@@ -188,18 +188,32 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
     let mut follow = true;
     let mut active_match_idx: Option<usize> = None;
     let mut expanded_match_idx: Option<usize> = None;
+    let mut expanded_scroll: usize = 0;
 
     // Caching explainshell Explanation results
     let cache = Arc::new(Mutex::new(std::collections::HashMap::<String, explainshell::Explanation>::new()));
     let mut last_selected = usize::MAX;
     let mut last_active_match_idx: Option<usize> = None;
     let mut last_expanded_match_idx: Option<usize> = None;
+    let mut last_expanded_scroll = usize::MAX;
     let mut last_cache_status: Option<String> = None;
     let mut last_count = usize::MAX;
 
     loop {
         let (cols, rows) = size()?;
         let visible_list_rows = (rows as usize).saturating_sub(1);
+
+        // Clamp expanded_scroll using the .max_scroll file written by watch_json_mode
+        if expanded_match_idx.is_some() {
+            let max_scroll_path = json_path.replace(".json", ".max_scroll");
+            if let Ok(s) = std::fs::read_to_string(&max_scroll_path) {
+                if let Ok(max_scroll) = s.trim().parse::<usize>() {
+                    if expanded_scroll > max_scroll {
+                        expanded_scroll = max_scroll;
+                    }
+                }
+            }
+        }
 
         let mut should_redraw = false;
         let current_explanation: explainshell::Explanation;
@@ -212,7 +226,7 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
 
         if count != last_count {
             should_redraw = true;
-            if follow && count > 0 {
+            if follow && count > 0 && expanded_match_idx.is_none() {
                 scroll = count.saturating_sub(visible_list_rows);
                 selected = count - 1;
             }
@@ -300,6 +314,7 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
         if selected != last_selected 
             || active_match_idx != last_active_match_idx 
             || expanded_match_idx != last_expanded_match_idx
+            || expanded_scroll != last_expanded_scroll
             || Some(&current_cache_status) != last_cache_status.as_ref() 
             || should_redraw 
         {
@@ -308,7 +323,14 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
             // Generate JSON and write to file for the bottom pane
             let active_status = cmds.get(selected).and_then(|c| c.status);
             let active_pid = cmds.get(selected).map(|c| c.id);
-            let json_str = explainshell::explanation_to_json(&current_explanation, active_match_idx, expanded_match_idx, active_status, active_pid);
+            let json_str = explainshell::explanation_to_json(
+                &current_explanation, 
+                active_match_idx, 
+                expanded_match_idx, 
+                expanded_scroll,
+                active_status, 
+                active_pid
+            );
             
             let temp_json_path = format!("{}.tmp", json_path);
             let write_res = std::fs::write(&temp_json_path, &json_str)
@@ -321,6 +343,7 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
             last_selected = selected;
             last_active_match_idx = active_match_idx;
             last_expanded_match_idx = expanded_match_idx;
+            last_expanded_scroll = expanded_scroll;
             last_cache_status = Some(current_cache_status);
         }
 
@@ -332,45 +355,64 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
                     }
                     match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
-                        active_match_idx = None;
-                        expanded_match_idx = None;
-                        follow = false;
-                        selected = selected.saturating_sub(1);
-                        scroll = scroll.min(selected);
+                        if expanded_match_idx.is_some() {
+                            expanded_scroll = expanded_scroll.saturating_sub(1);
+                        } else {
+                            active_match_idx = None;
+                            expanded_match_idx = None;
+                            follow = false;
+                            selected = selected.saturating_sub(1);
+                            scroll = scroll.min(selected);
+                        }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        active_match_idx = None;
-                        expanded_match_idx = None;
-                        let count = commands.lock().unwrap().len();
-                        if selected + 1 < count {
-                            selected += 1;
+                        if expanded_match_idx.is_some() {
+                            let max_scroll_path = json_path.replace(".json", ".max_scroll");
+                            let max_scroll = std::fs::read_to_string(&max_scroll_path)
+                                .ok()
+                                .and_then(|s| s.trim().parse::<usize>().ok())
+                                .unwrap_or(usize::MAX);
+                            if expanded_scroll < max_scroll {
+                                expanded_scroll += 1;
+                            }
+                        } else {
+                            active_match_idx = None;
+                            expanded_match_idx = None;
+                            let count = commands.lock().unwrap().len();
+                            if selected + 1 < count {
+                                selected += 1;
+                            }
+                            if selected >= scroll + visible_list_rows {
+                                scroll = selected + 1 - visible_list_rows;
+                            }
+                            follow = selected + 1 == count;
                         }
-                        if selected >= scroll + visible_list_rows {
-                            scroll = selected + 1 - visible_list_rows;
-                        }
-                        follow = selected + 1 == count;
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
-                        if let Some(m_idx) = active_match_idx {
-                            if m_idx > 0 {
-                                active_match_idx = Some(m_idx - 1);
-                                expanded_match_idx = None;
-                            } else {
-                                active_match_idx = None;
-                                expanded_match_idx = None;
+                        if expanded_match_idx.is_none() {
+                            if let Some(m_idx) = active_match_idx {
+                                if m_idx > 0 {
+                                    active_match_idx = Some(m_idx - 1);
+                                    expanded_match_idx = None;
+                                } else {
+                                    active_match_idx = None;
+                                    expanded_match_idx = None;
+                                }
                             }
                         }
                     }
                     KeyCode::Right | KeyCode::Char('l') => {
-                        if active_match_idx.is_none() {
-                            if !current_explanation.matches.is_empty() {
-                                active_match_idx = Some(0);
-                                expanded_match_idx = None;
-                            }
-                        } else if let Some(m_idx) = active_match_idx {
-                            if m_idx + 1 < current_explanation.matches.len() {
-                                active_match_idx = Some(m_idx + 1);
-                                expanded_match_idx = None;
+                        if expanded_match_idx.is_none() {
+                            if active_match_idx.is_none() {
+                                if !current_explanation.matches.is_empty() {
+                                    active_match_idx = Some(0);
+                                    expanded_match_idx = None;
+                                }
+                            } else if let Some(m_idx) = active_match_idx {
+                                if m_idx + 1 < current_explanation.matches.len() {
+                                    active_match_idx = Some(m_idx + 1);
+                                    expanded_match_idx = None;
+                                }
                             }
                         }
                     }
@@ -378,13 +420,22 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
                         if let Some(m_idx) = active_match_idx {
                             if expanded_match_idx == Some(m_idx) {
                                 expanded_match_idx = None;
+                                expanded_scroll = 0;
                             } else {
                                 expanded_match_idx = Some(m_idx);
+                                expanded_scroll = 0;
                             }
+                        } else if !current_explanation.matches.is_empty() {
+                            active_match_idx = Some(0);
+                            expanded_match_idx = Some(0);
+                            expanded_scroll = 0;
                         }
                     }
                     KeyCode::Esc => {
-                        if active_match_idx.is_some() {
+                        if expanded_match_idx.is_some() {
+                            expanded_match_idx = None;
+                            expanded_scroll = 0;
+                        } else if active_match_idx.is_some() {
                             active_match_idx = None;
                             expanded_match_idx = None;
                         } else {
@@ -408,6 +459,7 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
     write!(stdout, "\x1b[2J\x1b[H")?;
     stdout.flush()?;
     let _ = std::fs::remove_file(&json_path);
+    let _ = std::fs::remove_file(json_path.replace(".json", ".max_scroll"));
     Ok(())
 }
 
@@ -422,6 +474,7 @@ struct ParsedJson {
     error: Option<String>,
     active_match_idx: Option<usize>,
     expanded_match_idx: Option<usize>,
+    expanded_scroll: usize,
     matches: Vec<ParsedMatch>,
 }
 
@@ -568,6 +621,7 @@ fn parse_json(json: &str) -> ParsedJson {
     let error = parse_string_field(&clean_json, "\"error\"");
     let active_match_idx = parse_usize_field(&clean_json, "\"active_match_idx\"");
     let expanded_match_idx = parse_usize_field(&clean_json, "\"expanded_match_idx\"");
+    let expanded_scroll = parse_usize_field(&clean_json, "\"expanded_scroll\"").unwrap_or(0);
     let matches = parse_matches(&clean_json);
 
     ParsedJson {
@@ -575,6 +629,7 @@ fn parse_json(json: &str) -> ParsedJson {
         error,
         active_match_idx,
         expanded_match_idx,
+        expanded_scroll,
         matches,
     }
 }
@@ -654,24 +709,25 @@ fn truncate_to_line(s: &str, max_len: usize) -> String {
     }
 }
 
-fn format_lines(content: &str, raw_json: bool, cols: u16) -> Vec<String> {
+fn format_lines(content: &str, raw_json: bool, cols: u16, rows: u16) -> (Vec<String>, usize) {
     if raw_json {
-        return content.lines().map(|s| s.to_string()).collect();
+        let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        return (lines, 0);
     }
     
     let trimmed = content.trim();
     if trimmed.is_empty() {
-        return vec!["\x1b[37mNo command selected or explanation loaded yet.\x1b[0m".to_string()];
+        return (vec!["\x1b[37mNo command selected or explanation loaded yet.\x1b[0m".to_string()], 0);
     }
     
     let parsed = parse_json(content);
     
     if let Some(err) = parsed.error {
-        return vec![format!("\x1b[37m{}\x1b[0m", err)];
+        return (vec![format!("\x1b[37m{}\x1b[0m", err)], 0);
     }
     
     if parsed.matches.is_empty() {
-        return vec!["\x1b[37mNo explanation matches found.\x1b[0m".to_string()];
+        return (vec!["\x1b[37mNo explanation matches found.\x1b[0m".to_string()], 0);
     }
     
     if let Some(idx) = parsed.expanded_match_idx {
@@ -683,10 +739,17 @@ fn format_lines(content: &str, raw_json: bool, cols: u16) -> Vec<String> {
             let cleaned_raw = clean_explanation(&m.explanation);
             let wrap_width = (cols as usize).saturating_sub(4);
             let rendered = render_html(&cleaned_raw, wrap_width);
-            for line in rendered.lines() {
+            
+            let desc_lines: Vec<&str> = rendered.lines().collect();
+            let max_lines = (rows as usize).saturating_sub(1);
+            let visible_desc_lines = max_lines.saturating_sub(2);
+            let max_scroll = desc_lines.len().saturating_sub(visible_desc_lines);
+            let scroll = parsed.expanded_scroll.min(max_scroll);
+            
+            for line in desc_lines.iter().skip(scroll) {
                 lines.push(format!("  \x1b[38;5;250m{}\x1b[0m", line));
             }
-            return lines;
+            return (lines, max_scroll);
         }
     }
     
@@ -718,7 +781,7 @@ fn format_lines(content: &str, raw_json: bool, cols: u16) -> Vec<String> {
         }
     }
     
-    lines
+    (lines, 0)
 }
 
 fn watch_json_mode(json_path: String, raw_json: bool) -> Result<()> {
@@ -740,7 +803,9 @@ fn watch_json_mode(json_path: String, raw_json: bool) -> Result<()> {
             Ok(content) => {
                 missing_count = 0;
                 if content != last_content {
-                    let lines = format_lines(&content, raw_json, cols);
+                    let (lines, max_scroll) = format_lines(&content, raw_json, cols, rows);
+                    let max_scroll_path = json_path.replace(".json", ".max_scroll");
+                    let _ = std::fs::write(&max_scroll_path, max_scroll.to_string());
                     if lines.len() <= max_lines {
                         print!("\x1b[H"); // Overwrite from top-left without blanking out screen
                         for (idx, line) in lines.iter().enumerate() {
@@ -792,6 +857,7 @@ fn watch_json_mode(json_path: String, raw_json: bool) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    let _ = std::fs::remove_file(json_path.replace(".json", ".max_scroll"));
     Ok(())
 }
 
@@ -1088,7 +1154,7 @@ mod tests {
     }
   ]
 }"#;
-        let lines = format_lines(json, false, 80);
+        let (lines, _max_scroll) = format_lines(json, false, 80, 24);
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("  ls"));
         assert!(lines[0].contains("list directory contents."));

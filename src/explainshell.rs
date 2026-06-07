@@ -334,6 +334,7 @@ pub fn explanation_to_json(
     exp: &Explanation,
     active_match_idx: Option<usize>,
     expanded_match_idx: Option<usize>,
+    expanded_scroll: usize,
     status: Option<i32>,
     pid: Option<u32>,
 ) -> String {
@@ -362,6 +363,9 @@ pub fn explanation_to_json(
     };
     meta_json.push_str(&format!(r#",
   "expanded_match_idx": {}"#, expanded_str));
+
+    meta_json.push_str(&format!(r#",
+  "expanded_scroll": {}"#, expanded_scroll));
 
     if let Some(err) = &exp.error {
         return format!(
