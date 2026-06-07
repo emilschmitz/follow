@@ -7,6 +7,10 @@ edition = "2024"
 name = "flw"
 path = "src/main.rs"
 
+[[bin]]
+name = "test_explain"
+path = "scratch/test_explain.rs"
+
 [dependencies]
 anyhow    = "1"
 crossterm = "0.29"

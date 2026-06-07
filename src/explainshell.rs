@@ -172,6 +172,10 @@ fn parse_command_div(html: &str) -> (String, Vec<(usize, usize, String)>) {
                         active_help_id = Some(help_id);
                         active_start = formatted.chars().count();
                     }
+                } else if tag.contains("class=\"") && tag.contains("unknown") {
+                    let help_id = format!("unknown-{}", formatted.chars().count());
+                    active_help_id = Some(help_id);
+                    active_start = formatted.chars().count();
                 }
                 i += end + 1;
                 continue;
@@ -277,7 +281,15 @@ pub fn parse_html(cmd: &str, html: &str) -> Explanation {
     let mut matches = Vec::new();
     let mut idx = 0;
     for (start, end, ref_id) in &formatted_spans {
-        if let Some((_, help_text)) = help_boxes.iter().find(|(h_id, _)| h_id == ref_id) {
+        let help_text_opt = if ref_id.starts_with("unknown-") {
+            Some("Unknown option / argument (no explanation available in explainshell)".to_string())
+        } else {
+            help_boxes.iter()
+                .find(|(h_id, _)| h_id == ref_id)
+                .map(|(_, help_text)| help_text.clone())
+        };
+
+        if let Some(help_text) = help_text_opt {
             let source: String = if let Some(ref f) = formatted_command {
                 f.chars().skip(*start).take(end - start).collect()
             } else {
@@ -286,7 +298,7 @@ pub fn parse_html(cmd: &str, html: &str) -> Explanation {
             matches.push(Match {
                 index: idx,
                 source,
-                explanation: help_text.clone(),
+                explanation: help_text,
                 start: *start,
                 end: *end,
             });

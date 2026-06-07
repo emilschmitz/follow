@@ -306,7 +306,13 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
             let active_status = cmds.get(selected).and_then(|c| c.status);
             let active_pid = cmds.get(selected).map(|c| c.id);
             let json_str = explainshell::explanation_to_json(&current_explanation, active_match_idx, active_status, active_pid);
-            let _ = std::fs::write(&json_path, json_str);
+            
+            let temp_json_path = format!("{}.tmp", json_path);
+            let write_res = std::fs::write(&temp_json_path, &json_str)
+                .and_then(|_| std::fs::rename(&temp_json_path, &json_path));
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/flw_debug.log") {
+                let _ = writeln!(f, "Redraw triggered. active_match_idx: {:?}, write_success: {}", active_match_idx, write_res.is_ok());
+            }
 
             render_list(&cmds, selected, scroll, &current_explanation, active_match_idx, cols, rows, &mut stdout)?;
             last_selected = selected;
@@ -316,7 +322,11 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
 
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
-                Event::Key(key) => match key.code {
+                Event::Key(key) => {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/flw_debug.log") {
+                        let _ = writeln!(f, "Key pressed: {:?}", key.code);
+                    }
+                    match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
                         active_match_idx = None;
                         follow = false;
@@ -363,8 +373,9 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
                     }
                     KeyCode::Char('q') => break,
                     _ => {}
-                },
-                Event::Resize(c, r) => {
+                }
+            },
+            Event::Resize(c, r) => {
                     let cmds = commands.lock().unwrap();
                     render_list(&cmds, selected, scroll, &current_explanation, active_match_idx, c, r, &mut stdout)?;
                     last_count = cmds.len();
@@ -389,11 +400,54 @@ fn watch_json_mode(json_path: String) -> Result<()> {
     io::stdout().flush()?;
     
     loop {
+        let (_cols, rows) = match size() {
+            Ok((c, r)) => (c, r),
+            Err(_) => (80, 24),
+        };
+        let max_lines = (rows as usize).saturating_sub(1); // Leave 1 line safety margin
+
         match std::fs::read_to_string(&json_path) {
             Ok(content) => {
                 missing_count = 0;
                 if content != last_content {
-                    print!("\x1b[H\x1b[2J{}", content);
+                    let lines: Vec<&str> = content.lines().collect();
+                    if lines.len() <= max_lines {
+                        print!("\x1b[H"); // Overwrite from top-left without blanking out screen
+                        for (idx, line) in lines.iter().enumerate() {
+                            if idx > 0 {
+                                print!("\r\n");
+                            }
+                            print!("{}\x1b[K", line); // Clear line to prevent trailing leftovers
+                        }
+                        print!("\x1b[J"); // Clear remaining old lines below
+                    } else {
+                        // Find the line containing the highlight marker \x1b[31;1m
+                        let mut highlight_line_idx = None;
+                        for (idx, line) in lines.iter().enumerate() {
+                            if line.contains("\x1b[31;1m") {
+                                highlight_line_idx = Some(idx);
+                                break;
+                            }
+                        }
+
+                        let start_line = if let Some(h_idx) = highlight_line_idx {
+                            h_idx.saturating_sub(max_lines / 2)
+                        } else {
+                            0
+                        };
+
+                        let end_line = (start_line + max_lines).min(lines.len());
+                        let start_line = end_line.saturating_sub(max_lines);
+
+                        print!("\x1b[H"); // Overwrite from top-left without blanking out screen
+                        for i in start_line..end_line {
+                            if i > start_line {
+                                print!("\r\n");
+                            }
+                            print!("{}\x1b[K", lines[i]); // Clear line to prevent trailing leftovers
+                        }
+                        print!("\x1b[J"); // Clear remaining old lines below
+                    }
                     io::stdout().flush()?;
                     last_content = content;
                 }
@@ -410,6 +464,7 @@ fn watch_json_mode(json_path: String) -> Result<()> {
     }
     Ok(())
 }
+
 
 
 // ── Launch mode ───────────────────────────────────────────────────────────────
@@ -485,25 +540,28 @@ fn launch_mode(agent_name: String, extra_args: Vec<String>) -> Result<()> {
 
     let toggle_script_path = PathBuf::from(format!("/tmp/flw_{}_toggle.sh", pid));
     let toggle_script = format!(
-        "#!/bin/sh\nif [ \"$(tmux list-panes | wc -l)\" -eq 1 ]; then\n  tmux split-window -h {}\n  tmux split-window -v {}\nelse\n  tmux kill-pane -a -t 0\nfi\n",
+        "#!/bin/sh\nif [ \"$(tmux list-panes | wc -l)\" -eq 1 ]; then\n  tmux split-window -h {}\n  tmux split-window -v -d {}\nelse\n  tmux kill-pane -a -t 0\nfi\n",
         sq(&right_top_cmd),
         sq(&right_bottom_cmd)
     );
     std::fs::write(&toggle_script_path, &toggle_script)?;
     std::fs::set_permissions(&toggle_script_path, std::fs::Permissions::from_mode(0o755))?;
 
-    // Ctrl+F toggle using a dedicated shell script to avoid escaping hell
+    let toggle_key = std::env::var("FLW_KEY").unwrap_or_else(|_| "C-f".to_string());
+
+    // Toggle key binding using a dedicated shell script to avoid escaping hell
     std::process::Command::new("tmux")
         .args([
-            "bind-key", "-n", "C-f",
+            "bind-key", "-n", &toggle_key,
             "run-shell",
             &toggle_script_path.to_string_lossy(),
         ])
         .status()?;
 
-    // Also clean up the C-f binding when agi exits
+    // Also clean up the binding when agi exits
     let cleanup = format!(
-        "; tmux unbind-key -n C-f 2>/dev/null; rm -rf {} {} {} {}",
+        "; tmux unbind-key -n {} 2>/dev/null; rm -rf {} {} {} {}",
+        sq(&toggle_key),
         sq(&wrapper_dir.to_string_lossy()),
         sq(&trace_path.to_string_lossy()),
         sq(&json_path.to_string_lossy()),
