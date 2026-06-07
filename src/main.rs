@@ -598,6 +598,51 @@ fn clean_explanation(explanation: &str) -> String {
     s.to_string()
 }
 
+
+
+fn render_html(html_or_text: &str, cols: usize) -> String {
+    use std::io::Write;
+    let child = std::process::Command::new("w3m")
+        .args(["-dump", "-T", "text/html", "-cols", &cols.to_string()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok();
+        
+    if let Some(mut child) = child {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(html_or_text.as_bytes());
+        }
+        if let Ok(output) = child.wait_with_output() {
+            if output.status.success() {
+                return String::from_utf8_lossy(&output.stdout).trim().to_string();
+            }
+        }
+    }
+    explainshell::strip_html_tags(html_or_text)
+}
+
+fn get_first_description_line(text: &str) -> String {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if (trimmed.starts_with('-') && trimmed.len() <= 6) || trimmed.len() <= 3 {
+            continue;
+        }
+        return trimmed.to_string();
+    }
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    String::new()
+}
+
 fn truncate_to_line(s: &str, max_len: usize) -> String {
     let flat: String = s.replace('\n', " ").replace('\r', " ");
     let char_count = flat.chars().count();
@@ -634,8 +679,11 @@ fn format_lines(content: &str, raw_json: bool, cols: u16) -> Vec<String> {
             let mut lines = Vec::new();
             lines.push(format!("\x1b[31;1m{}\x1b[0m", m.source));
             lines.push(String::new());
-            let cleaned_exp = clean_explanation(&m.explanation);
-            for line in cleaned_exp.lines() {
+            
+            let cleaned_raw = clean_explanation(&m.explanation);
+            let wrap_width = (cols as usize).saturating_sub(4);
+            let rendered = render_html(&cleaned_raw, wrap_width);
+            for line in rendered.lines() {
                 lines.push(format!("  \x1b[38;5;250m{}\x1b[0m", line));
             }
             return lines;
@@ -654,16 +702,19 @@ fn format_lines(content: &str, raw_json: bool, cols: u16) -> Vec<String> {
         let padding = " ".repeat(pad_len);
         let is_active = parsed.active_match_idx == Some(m.index);
         
-        let left_width = max_source_len + 4;
+        let left_width = max_source_len + 2;
         let avail_width = (cols as usize).saturating_sub(left_width + 2);
         
-        let cleaned_exp = clean_explanation(&m.explanation);
-        let truncated_exp = truncate_to_line(&cleaned_exp, avail_width);
+        let cleaned_raw = clean_explanation(&m.explanation);
+        let rendered = render_html(&cleaned_raw, 500);
+        
+        let desc = get_first_description_line(&rendered);
+        let truncated_exp = truncate_to_line(&desc, avail_width);
         
         if is_active {
-            lines.push(format!("\x1b[31;1m▸ {} ◂{}\x1b[0m  \x1b[38;5;250m{}\x1b[0m", m.source, padding, truncated_exp));
+            lines.push(format!("\x1b[31;1m▸ {}{}\x1b[0m  \x1b[38;5;250m{}\x1b[0m", m.source, padding, truncated_exp));
         } else {
-            lines.push(format!("\x1b[31m  {}  {}\x1b[0m  \x1b[38;5;250m{}\x1b[0m", m.source, padding, truncated_exp));
+            lines.push(format!("\x1b[33m  {}{}\x1b[0m  \x1b[38;5;250m{}\x1b[0m", m.source, padding, truncated_exp));
         }
     }
     
@@ -978,14 +1029,25 @@ mod tests {
 }"#;
         let lines = format_lines(json, false, 80);
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("  ls  "));
+        assert!(lines[0].contains("  ls"));
         assert!(lines[0].contains("list directory contents."));
         assert!(!lines[0].contains("[source]"));
         
-        assert!(lines[1].contains("▸ -la ◂"));
+        assert!(lines[1].contains("▸ -la"));
         assert!(lines[1].contains("do not ignore entries starting with . and use a long listing format"));
         assert!(!lines[1].contains("[soruce]"));
     }
+
+    #[test]
+    fn test_get_first_description_line() {
+        let exp = "  -l\n  List in long format, giving mode...";
+        assert_eq!(get_first_description_line(exp), "List in long format, giving mode...");
+        
+        let exp2 = "Just a plain description sentence.";
+        assert_eq!(get_first_description_line(exp2), "Just a plain description sentence.");
+    }
+
+
 
     #[test]
     fn test_strip_shopt_wrapper() {

@@ -76,7 +76,7 @@ pub fn fetch_html(cmd: &str) -> Result<String> {
 }
 
 /// Clean up HTML content, stripping tags and restoring formatting (newliness/spaces).
-fn strip_html_tags(html: &str) -> String {
+pub fn strip_html_tags(html: &str) -> String {
     let mut output = String::new();
     let mut in_tag = false;
     let mut last_was_space = false;
@@ -267,8 +267,7 @@ pub fn parse_html(cmd: &str, html: &str) -> Explanation {
                 let content_start = start_pos + id_end + tag_end + 1;
                 if let Some(div_end) = html[content_start..].find("</div>") {
                     let inner_html = &html[content_start..content_start + div_end];
-                    let clean_text = strip_html_tags(inner_html);
-                    help_boxes.push((id.to_string(), clean_text));
+                    help_boxes.push((id.to_string(), inner_html.to_string()));
                     search_idx = content_start + div_end + 6;
                     continue;
                 }

@@ -8,3 +8,4 @@
 
 - [ ] **Fallback Help Content** — when ExplainShell returns a "missing man page" error (e.g. for new commands like `uv`), fall back to dynamically using an LLM or, alternatively, querying the command's own `--help` output and formatting/displaying it in the explanation pane.
 
+- [ ] **ExplainShell Option Splitting** — when explainshell groups multiple options into a single help-box block (e.g. returning options `-l`, `-m`, `-n` all inside a single block for Plan 9 `ls`), write a custom post-processor/parser to isolate and extract only the relevant selected option flag description rather than displaying the whole block list.
