@@ -187,11 +187,13 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
     let mut scroll: usize = 0;
     let mut follow = true;
     let mut active_match_idx: Option<usize> = None;
+    let mut expanded_match_idx: Option<usize> = None;
 
     // Caching explainshell Explanation results
     let cache = Arc::new(Mutex::new(std::collections::HashMap::<String, explainshell::Explanation>::new()));
     let mut last_selected = usize::MAX;
     let mut last_active_match_idx: Option<usize> = None;
+    let mut last_expanded_match_idx: Option<usize> = None;
     let mut last_cache_status: Option<String> = None;
     let mut last_count = usize::MAX;
 
@@ -297,6 +299,7 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
 
         if selected != last_selected 
             || active_match_idx != last_active_match_idx 
+            || expanded_match_idx != last_expanded_match_idx
             || Some(&current_cache_status) != last_cache_status.as_ref() 
             || should_redraw 
         {
@@ -305,18 +308,19 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
             // Generate JSON and write to file for the bottom pane
             let active_status = cmds.get(selected).and_then(|c| c.status);
             let active_pid = cmds.get(selected).map(|c| c.id);
-            let json_str = explainshell::explanation_to_json(&current_explanation, active_match_idx, active_status, active_pid);
+            let json_str = explainshell::explanation_to_json(&current_explanation, active_match_idx, expanded_match_idx, active_status, active_pid);
             
             let temp_json_path = format!("{}.tmp", json_path);
             let write_res = std::fs::write(&temp_json_path, &json_str)
                 .and_then(|_| std::fs::rename(&temp_json_path, &json_path));
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/flw_debug.log") {
-                let _ = writeln!(f, "Redraw triggered. active_match_idx: {:?}, write_success: {}", active_match_idx, write_res.is_ok());
+                let _ = writeln!(f, "Redraw triggered. active_match_idx: {:?}, expanded_match_idx: {:?}, write_success: {}", active_match_idx, expanded_match_idx, write_res.is_ok());
             }
 
             render_list(&cmds, selected, scroll, &current_explanation, active_match_idx, cols, rows, &mut stdout)?;
             last_selected = selected;
             last_active_match_idx = active_match_idx;
+            last_expanded_match_idx = expanded_match_idx;
             last_cache_status = Some(current_cache_status);
         }
 
@@ -329,12 +333,14 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
                     match key.code {
                     KeyCode::Up | KeyCode::Char('k') => {
                         active_match_idx = None;
+                        expanded_match_idx = None;
                         follow = false;
                         selected = selected.saturating_sub(1);
                         scroll = scroll.min(selected);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         active_match_idx = None;
+                        expanded_match_idx = None;
                         let count = commands.lock().unwrap().len();
                         if selected + 1 < count {
                             selected += 1;
@@ -348,8 +354,10 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
                         if let Some(m_idx) = active_match_idx {
                             if m_idx > 0 {
                                 active_match_idx = Some(m_idx - 1);
+                                expanded_match_idx = None;
                             } else {
                                 active_match_idx = None;
+                                expanded_match_idx = None;
                             }
                         }
                     }
@@ -357,16 +365,28 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
                         if active_match_idx.is_none() {
                             if !current_explanation.matches.is_empty() {
                                 active_match_idx = Some(0);
+                                expanded_match_idx = None;
                             }
                         } else if let Some(m_idx) = active_match_idx {
                             if m_idx + 1 < current_explanation.matches.len() {
                                 active_match_idx = Some(m_idx + 1);
+                                expanded_match_idx = None;
+                            }
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if let Some(m_idx) = active_match_idx {
+                            if expanded_match_idx == Some(m_idx) {
+                                expanded_match_idx = None;
+                            } else {
+                                expanded_match_idx = Some(m_idx);
                             }
                         }
                     }
                     KeyCode::Esc => {
                         if active_match_idx.is_some() {
                             active_match_idx = None;
+                            expanded_match_idx = None;
                         } else {
                             break;
                         }
@@ -391,7 +411,266 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
     Ok(())
 }
 
-fn watch_json_mode(json_path: String) -> Result<()> {
+struct ParsedMatch {
+    index: usize,
+    source: String,
+    explanation: String,
+}
+
+struct ParsedJson {
+    _command: String,
+    error: Option<String>,
+    active_match_idx: Option<usize>,
+    expanded_match_idx: Option<usize>,
+    matches: Vec<ParsedMatch>,
+}
+
+fn unescape_json(s: &str) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                match next {
+                    '"' => result.push('"'),
+                    '\\' => result.push('\\'),
+                    'n' => result.push('\n'),
+                    'r' => result.push('\r'),
+                    't' => result.push('\t'),
+                    _ => {
+                        result.push('\\');
+                        result.push(next);
+                    }
+                }
+            } else {
+                result.push('\\');
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+fn parse_usize_field(json: &str, key: &str) -> Option<usize> {
+    if let Some(pos) = json.find(key) {
+        let after = &json[pos + key.len()..];
+        let mut chars = after.chars().peekable();
+        while let Some(&c) = chars.peek() {
+            if c == ':' || c.is_whitespace() {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let mut val_str = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_digit(10) {
+                val_str.push(c);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if !val_str.is_empty() {
+            return val_str.parse().ok();
+        }
+    }
+    None
+}
+
+fn parse_string_field(json: &str, key: &str) -> Option<String> {
+    if let Some(pos) = json.find(key) {
+        let after = &json[pos + key.len()..];
+        if let Some(start_quote) = after.find('"') {
+            let str_start = start_quote + 1;
+            let mut escaped = false;
+            let mut end_quote = None;
+            let chars: Vec<(usize, char)> = after[str_start..].char_indices().collect();
+            for (idx, c) in chars {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    end_quote = Some(str_start + idx);
+                    break;
+                }
+            }
+            if let Some(end) = end_quote {
+                let raw_str = &after[str_start..end];
+                return Some(unescape_json(raw_str));
+            }
+        }
+    }
+    None
+}
+
+fn parse_matches(json: &str) -> Vec<ParsedMatch> {
+    let mut matches = Vec::new();
+    if let Some(matches_start) = json.find("\"matches\":") {
+        let after_matches = &json[matches_start..];
+        if let Some(arr_start) = after_matches.find('[') {
+            let mut arr_content = &after_matches[arr_start + 1..];
+            while let Some(obj_start) = arr_content.find('{') {
+                let mut brace_depth = 0;
+                let mut in_string = false;
+                let mut escaped = false;
+                let mut obj_end = None;
+                let chars: Vec<(usize, char)> = arr_content[obj_start..].char_indices().collect();
+                for (idx, c) in chars {
+                    if in_string {
+                        if escaped {
+                            escaped = false;
+                        } else if c == '\\' {
+                            escaped = true;
+                        } else if c == '"' {
+                            in_string = false;
+                        }
+                    } else {
+                        if c == '"' {
+                            in_string = true;
+                        } else if c == '{' {
+                            brace_depth += 1;
+                        } else if c == '}' {
+                            brace_depth -= 1;
+                            if brace_depth == 0 {
+                                obj_end = Some(obj_start + idx);
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                if let Some(end) = obj_end {
+                    let obj_str = &arr_content[obj_start..=end];
+                    let index = parse_usize_field(obj_str, "\"index\"").unwrap_or(0);
+                    let source = parse_string_field(obj_str, "\"source\"").unwrap_or_default();
+                    let explanation = parse_string_field(obj_str, "\"explanation\"").unwrap_or_default();
+                    matches.push(ParsedMatch { index, source, explanation });
+                    
+                    arr_content = &arr_content[end + 1..];
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    matches
+}
+
+fn parse_json(json: &str) -> ParsedJson {
+    let clean_json = json
+        .replace("\x1b[31;1m", "")
+        .replace("\x1b[0m", "");
+    
+    let command = parse_string_field(&clean_json, "\"command\"").unwrap_or_default();
+    let error = parse_string_field(&clean_json, "\"error\"");
+    let active_match_idx = parse_usize_field(&clean_json, "\"active_match_idx\"");
+    let expanded_match_idx = parse_usize_field(&clean_json, "\"expanded_match_idx\"");
+    let matches = parse_matches(&clean_json);
+
+    ParsedJson {
+        _command: command,
+        error,
+        active_match_idx,
+        expanded_match_idx,
+        matches,
+    }
+}
+
+fn clean_explanation(explanation: &str) -> String {
+    let mut s = explanation.trim();
+    loop {
+        let lower = s.to_lowercase();
+        if lower.starts_with("[source]\n") {
+            s = s["[source]\n".len()..].trim();
+        } else if lower.starts_with("[source]\r\n") {
+            s = s["[source]\r\n".len()..].trim();
+        } else if lower.starts_with("[soruce]\n") {
+            s = s["[soruce]\n".len()..].trim();
+        } else if lower.starts_with("[soruce]\r\n") {
+            s = s["[soruce]\r\n".len()..].trim();
+        } else {
+            break;
+        }
+    }
+    s.to_string()
+}
+
+fn truncate_to_line(s: &str, max_len: usize) -> String {
+    let flat: String = s.replace('\n', " ").replace('\r', " ");
+    let char_count = flat.chars().count();
+    if char_count <= max_len {
+        flat
+    } else {
+        let truncated: String = flat.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{}...", truncated)
+    }
+}
+
+fn format_lines(content: &str, raw_json: bool, cols: u16) -> Vec<String> {
+    if raw_json {
+        return content.lines().map(|s| s.to_string()).collect();
+    }
+    
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return vec!["\x1b[37mNo command selected or explanation loaded yet.\x1b[0m".to_string()];
+    }
+    
+    let parsed = parse_json(content);
+    
+    if let Some(err) = parsed.error {
+        return vec![format!("\x1b[37m{}\x1b[0m", err)];
+    }
+    
+    if parsed.matches.is_empty() {
+        return vec!["\x1b[37mNo explanation matches found.\x1b[0m".to_string()];
+    }
+    
+    if let Some(idx) = parsed.expanded_match_idx {
+        if let Some(m) = parsed.matches.iter().find(|m| m.index == idx) {
+            let mut lines = Vec::new();
+            lines.push(format!("\x1b[31;1m{}\x1b[0m", m.source));
+            lines.push(String::new());
+            let cleaned_exp = clean_explanation(&m.explanation);
+            for line in cleaned_exp.lines() {
+                lines.push(format!("  \x1b[38;5;250m{}\x1b[0m", line));
+            }
+            return lines;
+        }
+    }
+    
+    let mut lines = Vec::new();
+    let max_source_len = parsed.matches.iter()
+        .map(|m| m.source.chars().count())
+        .max()
+        .unwrap_or(0);
+        
+    for m in &parsed.matches {
+        let source_len = m.source.chars().count();
+        let pad_len = max_source_len.saturating_sub(source_len);
+        let padding = " ".repeat(pad_len);
+        let is_active = parsed.active_match_idx == Some(m.index);
+        
+        let left_width = max_source_len + 4;
+        let avail_width = (cols as usize).saturating_sub(left_width + 2);
+        
+        let cleaned_exp = clean_explanation(&m.explanation);
+        let truncated_exp = truncate_to_line(&cleaned_exp, avail_width);
+        
+        if is_active {
+            lines.push(format!("\x1b[31;1m▸ {} ◂{}\x1b[0m  \x1b[38;5;250m{}\x1b[0m", m.source, padding, truncated_exp));
+        } else {
+            lines.push(format!("\x1b[31m  {}  {}\x1b[0m  \x1b[38;5;250m{}\x1b[0m", m.source, padding, truncated_exp));
+        }
+    }
+    
+    lines
+}
+
+fn watch_json_mode(json_path: String, raw_json: bool) -> Result<()> {
     let mut last_content = String::new();
     let mut missing_count = 0;
     
@@ -400,7 +679,7 @@ fn watch_json_mode(json_path: String) -> Result<()> {
     io::stdout().flush()?;
     
     loop {
-        let (_cols, rows) = match size() {
+        let (cols, rows) = match size() {
             Ok((c, r)) => (c, r),
             Err(_) => (80, 24),
         };
@@ -410,7 +689,7 @@ fn watch_json_mode(json_path: String) -> Result<()> {
             Ok(content) => {
                 missing_count = 0;
                 if content != last_content {
-                    let lines: Vec<&str> = content.lines().collect();
+                    let lines = format_lines(&content, raw_json, cols);
                     if lines.len() <= max_lines {
                         print!("\x1b[H"); // Overwrite from top-left without blanking out screen
                         for (idx, line) in lines.iter().enumerate() {
@@ -500,7 +779,7 @@ fn write_wrapper(path: PathBuf, real: &PathBuf, trace: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn launch_mode(agent_name: String, extra_args: Vec<String>) -> Result<()> {
+fn launch_mode(agent_name: String, extra_args: Vec<String>, raw_json: bool) -> Result<()> {
     let agent_path = which::which(&agent_name)
         .unwrap_or_else(|_| panic!("'{}' not found in PATH", agent_name));
 
@@ -531,12 +810,20 @@ fn launch_mode(agent_name: String, extra_args: Vec<String>) -> Result<()> {
         sq(&json_path.to_string_lossy()),
     );
 
-    // Right pane bottom: flw --watch-json <json>
-    let right_bottom_cmd = format!(
-        "{} --watch-json {}",
-        sq(&flw_bin.to_string_lossy()),
-        sq(&json_path.to_string_lossy()),
-    );
+    // Right pane bottom: flw --watch-json [--raw-json] <json>
+    let right_bottom_cmd = if raw_json {
+        format!(
+            "{} --watch-json --raw-json {}",
+            sq(&flw_bin.to_string_lossy()),
+            sq(&json_path.to_string_lossy()),
+        )
+    } else {
+        format!(
+            "{} --watch-json {}",
+            sq(&flw_bin.to_string_lossy()),
+            sq(&json_path.to_string_lossy()),
+        )
+    };
 
     let toggle_script_path = PathBuf::from(format!("/tmp/flw_{}_toggle.sh", pid));
     let toggle_script = format!(
@@ -560,7 +847,7 @@ fn launch_mode(agent_name: String, extra_args: Vec<String>) -> Result<()> {
 
     // Also clean up the binding when agi exits
     let cleanup = format!(
-        "; tmux unbind-key -n {} 2>/dev/null; rm -rf {} {} {} {}",
+        "; tmux unbind-key -n {} 2>/dev/null; rm -rf {} {} {} {}; tmux kill-window -t \"$TMUX_PANE\" 2>/dev/null || tmux kill-window 2>/dev/null",
         sq(&toggle_key),
         sq(&wrapper_dir.to_string_lossy()),
         sq(&trace_path.to_string_lossy()),
@@ -601,7 +888,7 @@ fn launch_mode(agent_name: String, extra_args: Vec<String>) -> Result<()> {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
 
     if argv.first().map(String::as_str) == Some("--watch-list") {
         let trace = argv.get(1).cloned().expect("flw --watch-list <trace_file> <json_file>");
@@ -610,8 +897,19 @@ fn main() -> Result<()> {
     }
     
     if argv.first().map(String::as_str) == Some("--watch-json") {
-        let json = argv.get(1).cloned().expect("flw --watch-json <json_file>");
-        return watch_json_mode(json);
+        let has_raw = argv.get(1).map(String::as_str) == Some("--raw-json");
+        let json = if has_raw {
+            argv.get(2).cloned().expect("flw --watch-json --raw-json <json_file>")
+        } else {
+            argv.get(1).cloned().expect("flw --watch-json <json_file>")
+        };
+        return watch_json_mode(json, has_raw);
+    }
+
+    let mut raw_json = false;
+    if let Some(pos) = argv.iter().position(|arg| arg == "--raw-json") {
+        raw_json = true;
+        argv.remove(pos);
     }
 
     let agent_name = argv
@@ -620,12 +918,74 @@ fn main() -> Result<()> {
         .expect("Usage: flw <agent>  e.g.  flw agi");
     let extra_args = argv[1..].to_vec();
 
-    launch_mode(agent_name, extra_args)
+    launch_mode(agent_name, extra_args, raw_json)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_clean_explanation() {
+        assert_eq!(clean_explanation("[source]\nHello World"), "Hello World");
+        assert_eq!(clean_explanation("[soruce]\r\nHello World"), "Hello World");
+        assert_eq!(clean_explanation("[SOURCE]\nHello World"), "Hello World");
+        assert_eq!(clean_explanation("Hello World"), "Hello World");
+        assert_eq!(clean_explanation("  [soruce]\n  foo \n  "), "foo");
+    }
+
+    #[test]
+    fn test_parse_json() {
+        let json = r#"{
+  "command": "ls -la",
+  "active_match_idx": 0,
+  "expanded_match_idx": null,
+  "matches": [
+    {
+      "index": 0,
+      "source": "ls",
+      "explanation": "[source]\nlist directory contents"
+    }
+  ]
+}"#;
+        let parsed = parse_json(json);
+        assert_eq!(parsed.active_match_idx, Some(0));
+        assert_eq!(parsed.expanded_match_idx, None);
+        assert_eq!(parsed.matches.len(), 1);
+        assert_eq!(parsed.matches[0].index, 0);
+        assert_eq!(parsed.matches[0].source, "ls");
+        assert_eq!(parsed.matches[0].explanation, "[source]\nlist directory contents");
+    }
+
+    #[test]
+    fn test_format_lines() {
+        let json = r#"{
+  "command": "ls -la --color=always",
+  "active_match_idx": 1,
+  "expanded_match_idx": null,
+  "matches": [
+    {
+      "index": 0,
+      "source": "ls",
+      "explanation": "[source]\nlist directory contents."
+    },
+    {
+      "index": 1,
+      "source": "-la",
+      "explanation": "[soruce]\ndo not ignore entries starting with . and use a long listing format"
+    }
+  ]
+}"#;
+        let lines = format_lines(json, false, 80);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("  ls  "));
+        assert!(lines[0].contains("list directory contents."));
+        assert!(!lines[0].contains("[source]"));
+        
+        assert!(lines[1].contains("▸ -la ◂"));
+        assert!(lines[1].contains("do not ignore entries starting with . and use a long listing format"));
+        assert!(!lines[1].contains("[soruce]"));
+    }
 
     #[test]
     fn test_strip_shopt_wrapper() {
