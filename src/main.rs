@@ -27,19 +27,19 @@ impl Drop for TerminalRestorer {
 }
 
 
-fn highlight_cmd_source_by_index(cmd: &str, start: usize, end: usize) -> String {
+fn highlight_cmd_source_by_index(cmd: &str, start: usize, end: usize, bg_style: &str) -> String {
     let chars: Vec<char> = cmd.chars().collect();
     if start < end && end <= chars.len() {
         let before: String = chars[..start].iter().collect();
         let matched: String = chars[start..end].iter().collect();
         let after: String = chars[end..].iter().collect();
-        format!("{}\x1b[31;1;7m{}\x1b[27;0;7m{}", before, matched, after)
+        format!("{}\x1b[1;48;5;160;38;5;231m{}\x1b[0;{}m{}", before, matched, bg_style, after)
     } else {
         cmd.to_string()
     }
 }
 
-fn highlight_cmd_source(cmd: &str, source: &str) -> String {
+fn highlight_cmd_source(cmd: &str, source: &str, bg_style: &str) -> String {
     let clean_source = if let Some(idx) = source.find('(') {
         &source[..idx]
     } else {
@@ -50,7 +50,7 @@ fn highlight_cmd_source(cmd: &str, source: &str) -> String {
         let before = &cmd[..pos];
         let matched = &cmd[pos..pos + clean_source.len()];
         let after = &cmd[pos + clean_source.len()..];
-        format!("{}\x1b[31;1;7m{}\x1b[27;0;7m{}", before, matched, after)
+        format!("{}\x1b[1;48;5;160;38;5;231m{}\x1b[0;{}m{}", before, matched, bg_style, after)
     } else {
         cmd.to_string()
     }
@@ -69,24 +69,37 @@ fn render_list(
     stdout: &mut io::Stdout,
 ) -> Result<()> {
     let mut out = String::with_capacity(8192);
-    out.push_str("\x1b[H\x1b[2J\x1b[?25l");
+    // Hide cursor, clear screen, clear scrollback
+    out.push_str("\x1b[?25l\x1b[2J\x1b[3J");
 
-    let header_height = 1;
+    let header_height = 2;
     let list_height = (rows as usize).saturating_sub(header_height);
 
-    // 1. Header
-    let header = format!(" ◉ flw  {} cmds  (↑↓ scroll · ←→ inspect · q quit) ", cmds.len());
-    let header_line: String = header
-        .chars()
-        .chain(std::iter::repeat(' '))
-        .take(cols as usize)
-        .collect();
-    out.push_str("\x1b[7m");
-    out.push_str(&header_line);
-    out.push_str("\x1b[0m\r\n");
+    // 1. Header (Line 1)
+    let left_plain = format!("  🦅 FLW  •  {} commands", cmds.len());
+    let right_plain = "↑↓ scroll  ←→ inspect  q exit  ";
+    let left_len = left_plain.chars().count();
+    let right_len = right_plain.chars().count();
+    let pad_width = (cols as usize).saturating_sub(left_len + right_len);
+
+    let left_styled = format!("  \x1b[38;5;203m🦅\x1b[0m \x1b[1;38;5;203;1mFLW\x1b[0m  \x1b[38;5;242m•\x1b[0m  \x1b[38;5;250m{} commands\x1b[0m", cmds.len());
+    let right_styled = "\x1b[38;5;242m↑↓ scroll  ←→ inspect  q exit\x1b[0m  ";
+    
+    out.push_str("\x1b[1;1H"); // Move to row 1, col 1
+    out.push_str(&left_styled);
+    out.push_str(&" ".repeat(pad_width));
+    out.push_str(&right_styled);
+
+    // 1. Header (Line 2: Separator)
+    out.push_str("\x1b[2;1H"); // Move to row 2, col 1
+    let sep_chars = (cols as usize).saturating_sub(4);
+    out.push_str(&format!("  \x1b[38;5;238m{}\x1b[0m", "─".repeat(sep_chars)));
 
     // 2. Command List
     for i in 0..list_height {
+        let row_pos = i + 3;
+        out.push_str(&format!("\x1b[{};1H", row_pos)); // Move to row_pos, col 1
+
         let idx = scroll + i;
         if idx < cmds.len() {
             let cmd_text = &cmds[idx].text;
@@ -97,44 +110,65 @@ fn render_list(
             };
 
             if idx == selected {
-                if let Some(match_idx) = active_match_idx {
+                let avail_width = (cols as usize).saturating_sub(5);
+                let truncated_cmd: String = display_cmd.chars().take(avail_width).collect();
+                let bg_style = "48;5;236";
+                
+                let display_text = if let Some(match_idx) = active_match_idx {
                     if match_idx < explanation.matches.len() {
                         let m = &explanation.matches[match_idx];
-                        let display_text = if explanation.formatted_command.is_some() {
-                            highlight_cmd_source_by_index(display_cmd, m.start, m.end)
+                        let start = m.start.min(truncated_cmd.chars().count());
+                        let end = m.end.min(truncated_cmd.chars().count());
+                        if explanation.formatted_command.is_some() {
+                            highlight_cmd_source_by_index(&truncated_cmd, start, end, bg_style)
                         } else {
-                            highlight_cmd_source(display_cmd, &m.source)
-                        };
-                        let raw_len = display_cmd.chars().count();
-                        let pad_len = (cols as usize).saturating_sub(raw_len);
-                        let line = format!("\x1b[7m{}{}\x1b[0m", display_text, " ".repeat(pad_len));
-                        out.push_str(&line);
-                        out.push_str("\r\n");
-                        continue;
+                            highlight_cmd_source(&truncated_cmd, &m.source, bg_style)
+                        }
+                    } else {
+                        truncated_cmd
                     }
-                }
-                
-                let line: String = display_cmd
-                    .chars()
-                    .chain(std::iter::repeat(' '))
-                    .take(cols as usize)
-                    .collect();
-                out.push_str("\x1b[7m");
+                } else {
+                    truncated_cmd
+                };
+
+                let status_indicator_sel = match cmds[idx].status {
+                    Some(0) => "\x1b[38;5;119;1m●\x1b[0;48;5;236m",
+                    Some(_) => "\x1b[38;5;203;1m●\x1b[0;48;5;236m",
+                    None => "\x1b[38;5;75;1m●\x1b[0;48;5;236m",
+                };
+
+                let left_indicator = if active_match_idx.is_some() {
+                    " "
+                } else {
+                    "\x1b[38;5;203;1m▎\x1b[0;\x1b[48;5;236m"
+                };
+
+                let line = format!(
+                    "\x1b[48;5;236m{} {} {}\x1b[K\x1b[0m",
+                    left_indicator,
+                    status_indicator_sel,
+                    display_text
+                );
                 out.push_str(&line);
-                out.push_str("\x1b[0m");
             } else {
-                let line: String = display_cmd
-                    .chars()
-                    .chain(std::iter::repeat(' '))
-                    .take(cols as usize)
-                    .collect();
+                let avail_width = (cols as usize).saturating_sub(5);
+                let truncated_cmd: String = display_cmd.chars().take(avail_width).collect();
+                
+                let status_indicator_unsel = match cmds[idx].status {
+                    Some(0) => "\x1b[38;5;119m●\x1b[0m",
+                    Some(_) => "\x1b[38;5;203m●\x1b[0m",
+                    None => "\x1b[38;5;244m●\x1b[0m",
+                };
+
+                let line = format!(
+                    "  {} \x1b[38;5;250m{}\x1b[K\x1b[0m",
+                    status_indicator_unsel,
+                    truncated_cmd
+                );
                 out.push_str(&line);
             }
         } else {
-            out.push_str(&" ".repeat(cols as usize));
-        }
-        if i < list_height - 1 {
-            out.push_str("\r\n");
+            out.push_str("\x1b[K");
         }
     }
 
@@ -182,6 +216,13 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
     enable_raw_mode()?;
     let _restorer = TerminalRestorer;
     let mut stdout = io::stdout();
+    write!(stdout, "\x1b[?1049h")?; // Enter alternate screen
+    stdout.flush()?;
+
+    // Allow tmux window layout/resize to settle before first render query
+    std::thread::sleep(Duration::from_millis(100));
+    write!(stdout, "\x1b[H\x1b[2J\x1b[3J")?;
+    stdout.flush()?;
 
     let mut selected: usize = 0;
     let mut scroll: usize = 0;
@@ -189,6 +230,7 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
     let mut active_match_idx: Option<usize> = None;
     let mut expanded_match_idx: Option<usize> = None;
     let mut expanded_scroll: usize = 0;
+    let mut force_redraw = false;
 
     // Caching explainshell Explanation results
     let cache = Arc::new(Mutex::new(std::collections::HashMap::<String, explainshell::Explanation>::new()));
@@ -201,7 +243,24 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
 
     loop {
         let (cols, rows) = size()?;
-        let visible_list_rows = (rows as usize).saturating_sub(1);
+        let visible_list_rows = (rows as usize).saturating_sub(2);
+
+        let count = {
+            let cmds = commands.lock().unwrap();
+            cmds.len()
+        };
+
+        // Keep selected visible within scroll margins
+        if count > 0 && visible_list_rows > 2 {
+            let top_margin = 1;
+            let bottom_margin = 2;
+            if selected.saturating_sub(top_margin) < scroll {
+                scroll = selected.saturating_sub(top_margin);
+            }
+            if selected + bottom_margin >= scroll + visible_list_rows {
+                scroll = (selected + bottom_margin).saturating_sub(visible_list_rows);
+            }
+        }
 
         // Clamp expanded_scroll using the .max_scroll file written by watch_json_mode
         if expanded_match_idx.is_some() {
@@ -215,14 +274,10 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
             }
         }
 
-        let mut should_redraw = false;
+        let mut should_redraw = force_redraw;
+        force_redraw = false;
         let current_explanation: explainshell::Explanation;
         let current_cache_status: String;
-
-        let count = {
-            let cmds = commands.lock().unwrap();
-            cmds.len()
-        };
 
         if count != last_count {
             should_redraw = true;
@@ -362,7 +417,12 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
                             expanded_match_idx = None;
                             follow = false;
                             selected = selected.saturating_sub(1);
-                            scroll = scroll.min(selected);
+                            
+                            // Scroll up margin check: keep selected at least at scroll + 1
+                            let margin = 1;
+                            if selected.saturating_sub(margin) < scroll {
+                                scroll = selected.saturating_sub(margin);
+                            }
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
@@ -382,8 +442,11 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
                             if selected + 1 < count {
                                 selected += 1;
                             }
-                            if selected >= scroll + visible_list_rows {
-                                scroll = selected + 1 - visible_list_rows;
+                            
+                            // Scroll down margin check: keep selected at most at scroll + visible_list_rows - 2
+                            let margin = 2; // Selected row must be <= scroll + visible_list_rows - margin
+                            if selected + margin >= scroll + visible_list_rows {
+                                scroll = (selected + margin).saturating_sub(visible_list_rows);
                             }
                             follow = selected + 1 == count;
                         }
@@ -444,12 +507,10 @@ fn watch_list_mode(trace_path: String, json_path: String) -> Result<()> {
                     }
                     KeyCode::Char('q') => break,
                     _ => {}
+                    }
                 }
-            },
-            Event::Resize(c, r) => {
-                    let cmds = commands.lock().unwrap();
-                    render_list(&cmds, selected, scroll, &current_explanation, active_match_idx, c, r, &mut stdout)?;
-                    last_count = cmds.len();
+                Event::Resize(..) => {
+                    force_redraw = true;
                 }
                 _ => {}
             }
@@ -787,9 +848,16 @@ fn format_lines(content: &str, raw_json: bool, cols: u16, rows: u16) -> (Vec<Str
 fn watch_json_mode(json_path: String, raw_json: bool) -> Result<()> {
     let mut last_content = String::new();
     let mut missing_count = 0;
+    let mut last_cols = 0;
+    let mut last_rows = 0;
     
-    // Clear screen on start
-    print!("\x1b[H\x1b[2J");
+    // Enter alternate screen
+    print!("\x1b[?1049h");
+    io::stdout().flush()?;
+
+    // Allow tmux window layout/resize to settle before first render query
+    std::thread::sleep(Duration::from_millis(100));
+    print!("\x1b[H\x1b[2J\x1b[3J");
     io::stdout().flush()?;
     
     loop {
@@ -798,28 +866,27 @@ fn watch_json_mode(json_path: String, raw_json: bool) -> Result<()> {
             Err(_) => (80, 24),
         };
         let max_lines = (rows as usize).saturating_sub(1); // Leave 1 line safety margin
+        let size_changed = cols != last_cols || rows != last_rows;
 
         match std::fs::read_to_string(&json_path) {
             Ok(content) => {
                 missing_count = 0;
-                if content != last_content {
+                if content != last_content || size_changed {
                     let (lines, max_scroll) = format_lines(&content, raw_json, cols, rows);
                     let max_scroll_path = json_path.replace(".json", ".max_scroll");
                     let _ = std::fs::write(&max_scroll_path, max_scroll.to_string());
                     if lines.len() <= max_lines {
-                        print!("\x1b[H"); // Overwrite from top-left without blanking out screen
                         for (idx, line) in lines.iter().enumerate() {
-                            if idx > 0 {
-                                print!("\r\n");
-                            }
-                            print!("{}\x1b[K", line); // Clear line to prevent trailing leftovers
+                            print!("\x1b[{};1H{}\x1b[K", idx + 1, line);
                         }
-                        print!("\x1b[J"); // Clear remaining old lines below
+                        let next_row = lines.len() + 1;
+                        if next_row <= rows as usize {
+                            print!("\x1b[{};1H\x1b[J", next_row);
+                        }
                     } else {
-                        // Find the line containing the highlight marker \x1b[31;1m
                         let mut highlight_line_idx = None;
                         for (idx, line) in lines.iter().enumerate() {
-                            if line.contains("\x1b[31;1m") {
+                            if line.contains("\x1b[1;38;5;203m") {
                                 highlight_line_idx = Some(idx);
                                 break;
                             }
@@ -834,17 +901,19 @@ fn watch_json_mode(json_path: String, raw_json: bool) -> Result<()> {
                         let end_line = (start_line + max_lines).min(lines.len());
                         let start_line = end_line.saturating_sub(max_lines);
 
-                        print!("\x1b[H"); // Overwrite from top-left without blanking out screen
                         for i in start_line..end_line {
-                            if i > start_line {
-                                print!("\r\n");
-                            }
-                            print!("{}\x1b[K", lines[i]); // Clear line to prevent trailing leftovers
+                            let row_pos = i - start_line + 1;
+                            print!("\x1b[{};1H{}\x1b[K", row_pos, lines[i]);
                         }
-                        print!("\x1b[J"); // Clear remaining old lines below
+                        let next_row = (end_line - start_line) + 1;
+                        if next_row <= rows as usize {
+                            print!("\x1b[{};1H\x1b[J", next_row);
+                        }
                     }
                     io::stdout().flush()?;
                     last_content = content;
+                    last_cols = cols;
+                    last_rows = rows;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -858,6 +927,8 @@ fn watch_json_mode(json_path: String, raw_json: bool) -> Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
     let _ = std::fs::remove_file(json_path.replace(".json", ".max_scroll"));
+    print!("\x1b[?1049l"); // Leave alternate screen
+    let _ = io::stdout().flush();
     Ok(())
 }
 
@@ -1001,24 +1072,7 @@ fn launch_mode(agent_name: String, extra_args: Vec<String>, raw_json: bool) -> R
     };
 
     let toggle_script_path = PathBuf::from(format!("/tmp/flw_{}_toggle.sh", pid));
-    let toggle_script = format!(
-        "#!/bin/sh\nif [ \"$(tmux list-panes | wc -l)\" -eq 1 ]; then\n  tmux split-window -h {}\n  tmux split-window -v -d {}\nelse\n  tmux kill-pane -a -t 0\nfi\n",
-        sq(&right_top_cmd),
-        sq(&right_bottom_cmd)
-    );
-    std::fs::write(&toggle_script_path, &toggle_script)?;
-    std::fs::set_permissions(&toggle_script_path, std::fs::Permissions::from_mode(0o755))?;
-
     let toggle_key = std::env::var("FLW_KEY").unwrap_or_else(|_| "C-f".to_string());
-
-    // Toggle key binding using a dedicated shell script to avoid escaping hell
-    std::process::Command::new("tmux")
-        .args([
-            "bind-key", "-n", &toggle_key,
-            "run-shell",
-            &toggle_script_path.to_string_lossy(),
-        ])
-        .status()?;
 
     // Also clean up the binding when agi exits
     let cleanup = format!(
@@ -1037,24 +1091,93 @@ fn launch_mode(agent_name: String, extra_args: Vec<String>, raw_json: bool) -> R
         cleanup,
     );
 
-    if in_tmux {
+    let (agent_pane, agent_window) = if in_tmux {
         // Create a new window in the existing session (no nesting)
-        std::process::Command::new("tmux")
-            .args(["new-window", "-n", &window_name, &left_cmd])
-            .status()?;
-        // Focus is already on the new window; flw exits here
+        let output = std::process::Command::new("tmux")
+            .args(["new-window", "-P", "-F", "#{pane_id} #{window_id}", "-n", &window_name, &left_cmd])
+            .output()?;
+        let out_str = String::from_utf8_lossy(&output.stdout);
+        let mut parts = out_str.trim().split_whitespace();
+        let pane = parts.next().map(|s| s.to_string()).unwrap_or_else(|| "%0".to_string());
+        let window = parts.next().map(|s| s.to_string()).unwrap_or_else(|| "@0".to_string());
+
+        // Style pane borders for the newly created window so they disappear/blend in
+        let _ = std::process::Command::new("tmux")
+            .args(["set-option", "-t", &window, "pane-border-lines", "hidden"])
+            .status();
+        let _ = std::process::Command::new("tmux")
+            .args(["set-option", "-t", &window, "pane-border-style", "fg=black,bg=default"])
+            .status();
+        let _ = std::process::Command::new("tmux")
+            .args(["set-option", "-t", &window, "pane-active-border-style", "fg=black,bg=default"])
+            .status();
+        (pane, window)
     } else {
         // Not in tmux — create a session and attach
         let session = format!("flw_{}", pid);
-        std::process::Command::new("tmux")
-            .args(["new-session", "-d", "-s", &session, &left_cmd])
-            .status()?;
-        std::process::Command::new("tmux")
+        let output = std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &session, "-P", "-F", "#{pane_id} #{window_id}", &left_cmd])
+            .output()?;
+        let out_str = String::from_utf8_lossy(&output.stdout);
+        let mut parts = out_str.trim().split_whitespace();
+        let pane = parts.next().map(|s| s.to_string()).unwrap_or_else(|| "%0".to_string());
+        let window = parts.next().map(|s| s.to_string()).unwrap_or_else(|| "@0".to_string());
+
+        let _ = std::process::Command::new("tmux")
             .args(["set-option", "-t", &session, "status", "off"])
-            .status()?;
-        std::process::Command::new("tmux")
-            .args(["select-pane", "-t", &format!("{}:0.0", session)])
-            .status()?;
+            .status();
+        // Style pane borders for the session so they disappear/blend in
+        let _ = std::process::Command::new("tmux")
+            .args(["set-option", "-t", &window, "pane-border-lines", "hidden"])
+            .status();
+        let _ = std::process::Command::new("tmux")
+            .args(["set-option", "-t", &window, "pane-border-style", "fg=black,bg=default"])
+            .status();
+        let _ = std::process::Command::new("tmux")
+            .args(["set-option", "-t", &window, "pane-active-border-style", "fg=black,bg=default"])
+            .status();
+        let _ = std::process::Command::new("tmux")
+            .args(["select-pane", "-t", &pane])
+            .status();
+        (pane, window)
+    };
+
+    let toggle_script = format!(
+        "#!/bin/sh\n\
+        active_window=$(tmux display-message -p '#{{window_id}}')\n\
+        if [ \"$active_window\" != {} ]; then\n\
+          exit 0\n\
+        fi\n\
+        num_panes=$(tmux list-panes -t {} | wc -l)\n\
+        if [ \"$num_panes\" -eq 1 ]; then\n\
+          right_pane=$(tmux split-window -h -P -F \"#{{pane_id}}\" -t {} {})\n\
+          if [ -n \"$right_pane\" ]; then\n\
+            tmux split-window -v -l 62% -d -t \"$right_pane\" {}\n\
+          fi\n\
+        else\n\
+          tmux kill-pane -a -t {}\n\
+        fi\n",
+        sq(&agent_window),
+        sq(&agent_pane),
+        sq(&agent_pane),
+        sq(&right_top_cmd),
+        sq(&right_bottom_cmd),
+        sq(&agent_pane)
+    );
+    std::fs::write(&toggle_script_path, &toggle_script)?;
+    std::fs::set_permissions(&toggle_script_path, std::fs::Permissions::from_mode(0o755))?;
+
+    // Toggle key binding using a dedicated shell script to avoid escaping hell
+    std::process::Command::new("tmux")
+        .args([
+            "bind-key", "-n", &toggle_key,
+            "run-shell",
+            &toggle_script_path.to_string_lossy(),
+        ])
+        .status()?;
+
+    if !in_tmux {
+        let session = format!("flw_{}", pid);
         std::process::Command::new("tmux")
             .args(["attach-session", "-t", &session])
             .status()?;

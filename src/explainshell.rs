@@ -206,7 +206,10 @@ fn parse_command_div(html: &str) -> (String, Vec<(usize, usize, String)>) {
         if html[i..].starts_with("&lt;") { formatted.push('<'); i += 4; continue; }
         if html[i..].starts_with("&gt;") { formatted.push('>'); i += 4; continue; }
         if html[i..].starts_with("&quot;") { formatted.push('"'); i += 6; continue; }
+        if html[i..].starts_with("&#34;") { formatted.push('"'); i += 5; continue; }
         if html[i..].starts_with("&#39;") { formatted.push('\''); i += 5; continue; }
+        if html[i..].starts_with("&#x27;") { formatted.push('\''); i += 6; continue; }
+        if html[i..].starts_with("&nbsp;") { formatted.push(' '); i += 6; continue; }
         
         let c = chars[i];
         if c == '\n' || c == '\r' || c.is_whitespace() {
