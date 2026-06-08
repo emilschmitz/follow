@@ -25,3 +25,6 @@ cargo install --git https://github.com/emilschmitz/follow.git --bin flw
 
 This will build the binary and place it in your local cargo bin directory (`~/.cargo/bin/flw`), which is typically already in your shell's `PATH`.
 
+## Feedback
+
+If you've tried this tool out, I'd appreciate your feedback! Send an email to `e.schmitz at outlook.com`.
