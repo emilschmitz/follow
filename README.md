@@ -27,4 +27,4 @@ This will build the binary and place it in your local cargo bin directory (`~/.c
 
 ## Feedback
 
-If you've tried this tool out, I'd appreciate your feedback! Send an email to `e.schmitz at outlook.com`.
+If you've tried this tool out, I'd appreciate your feedback! Send an email to `[first-initial].schmitz at outlook.com`.
