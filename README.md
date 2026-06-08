@@ -1,6 +1,8 @@
 # 🦅 flw
 
-`flw` is a terminal user interface (TUI) tool that runs side-by-side with your agent or shell terminal. It tracks the commands you run and queries a local `explainshell` server to display explanations of all the components of the commmands the agent's has run.
+`flw` is a TUI tool for tracking and understanding the commands your coding agents run. It intercepts every command and queries a local [`explainshell`](https://github.com/idank/explainshell) server to display explanations thereof in a sidepane you can open with `C-f`.
+
+<img width="800" height="450" alt="flw_optimized" src="https://github.com/user-attachments/assets/c0952e78-9a60-4546-bfdb-05f3199a6520" />
 
 ## Quick Start
 
@@ -12,8 +14,6 @@ cargo install --git https://github.com/emilschmitz/follow.git --bin flw
 flw claude  # (or whatever agent you prefer)
 ```
 Toggle explanations inside the shell by pressing `Ctrl+F`.
-
-https://github.com/emilschmitz/follow/assets/.../demo.mp4
 
 ---
 
